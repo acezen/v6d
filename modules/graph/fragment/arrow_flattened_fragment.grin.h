@@ -51,11 +51,9 @@ namespace arrow_flattened_fragment_impl {
 
 struct Vertex {
   Vertex(GRIN_GRAPH g, GRIN_VERTEX v): g_(g), grin_v(v) {}
-  /*
   ~Vertex() {
     grin_destroy_vertex(g_, grin_v);
   }
-  */
 
   GRIN_GRAPH g_;
   GRIN_VERTEX grin_v;
@@ -291,8 +289,6 @@ class VertexRange {
   size_t begin_;
   size_t end_;
 };
-
-
 }  // namespace arrow_flattened_fragment_impl
 
 /**
@@ -336,14 +332,11 @@ class ArrowFlattenedFragment {
 
 #if defined(GRIN_WITH_VERTEX_PROPERTY) && defined(GRIN_WITH_EDGE_PROPERTY)  // property graph storage
   explicit ArrowFlattenedFragment(GRIN_PARTITIONED_GRAPH partitioned_graph, GRIN_PARTITION partition,
-      const char* v_prop_name, const char* e_prop_name) {
+      const std::string& v_prop_name, const std::string& e_prop_name)
+        : pg_(partitioned_graph), partition_(partition), v_prop_(v_prop_name), e_prop_(e_prop_name) {
     pg_ = partitioned_graph;
     partition_ = partition;
     g_ = grin_get_local_graph_from_partition(pg_, partition_);
-    // v_prop_ = grin_get_vertex_properties_by_name(g_, v_prop_name);
-    // e_prop_ = grin_get_edge_property_by_name(g_, e_prop_name);
-    v_prop_ = std::string(v_prop_name);
-    e_prop_ = std::string(e_prop_name);
     ivnum_ = ovnum_ = 0;
     auto vl = grin_get_vertex_list(g_);
     tvnum_ = grin_get_vertex_list_size(g_, vl);
@@ -364,9 +357,8 @@ class ArrowFlattenedFragment {
     grin_destroy_vertex_type_list(g_, vtl);
   }
 #else  // simple graph storage
-  explicit ArrowFlattenedFragment(GRIN_PARTITIONED_GRAPH partitioned_graph, GRIN_PARTITION partition) {
-    pg_ = partitioned_graph;
-    partition_ = partition;
+  explicit ArrowFlattenedFragment(GRIN_PARTITIONED_GRAPH partitioned_graph, GRIN_PARTITION partition)
+    : pg_(partitioned_graph), partition_(partition) {
     g_ = grin_get_local_graph_from_partition(pg_, partition_);
     auto vl = grin_get_vertex_list(g_)
     tvnum_ = grin_get_vertex_list_size(g_, vl);
@@ -433,6 +425,9 @@ class ArrowFlattenedFragment {
     return v != NULL;
 #else
     // get oid from iterating type oid, the first match if the oid
+    auto vt = grin_get_vertex_type_list(g_);
+    auto vts = grin_get_vertex_type_list_size(g_, vt);
+
     return false;
 #endif
   }
@@ -471,7 +466,6 @@ class ArrowFlattenedFragment {
   }
   */
 
-/*
   bool GetData(const vertex_t& v, vdata_t& value) const {
     if (v.grin_v == GRIN_NULL_VERTEX) return false;
 #ifdef GRIN_WITH_VERTEX_DATA
@@ -485,6 +479,7 @@ class ArrowFlattenedFragment {
     if (GRIN_DATATYPE_ENUM<vdata_t>::value != grin_get_vertex_property_data_type(g_, v_prop_)) return false;
     auto vtype = grin_get_vertex_type(g_, v.grin_v);
     auto vpt = grin_get_vertex_property_table_by_type(g_, vtype);
+    auto v_prop = grin_get
     auto _value = grin_get_value_from_vertex_property_table(g_, vpt, v, v_prop_);
     if (_value != NULL) {
       value = *(static_cast<vdata_t*>(_value));
@@ -493,7 +488,6 @@ class ArrowFlattenedFragment {
 #endif
     return false;
   }
-  */
 
   inline vid_t GetInnerVerticesNum() const { return ivnum_; }
 
@@ -627,8 +621,6 @@ class ArrowFlattenedFragment {
   GRIN_PARTITIONED_GRAPH pg_;
   GRIN_GRAPH g_;
   GRIN_PARTITION partition_;
-  // GRIN_VERTEX_PROPERTY v_prop_;
-  // GRIN_EDGE_PROPERTY e_prop_;
   std::string v_prop_, e_prop_;
 
   vid_t ivnum_;

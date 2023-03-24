@@ -38,8 +38,11 @@ void Traverse(vineyard::Client& client, const grape::CommSpec& comm_spec,
   GRIN_PARTITIONED_GRAPH pg = get_partitioned_graph_by_object_id(client, fragment_group_id);
 
   GRIN_PARTITION_LIST local_partitions = grin_get_local_partition_list(pg);
+  size_t pnum = grin_get_partition_list_size(pg, local_partitions);
+  assert(pnum > 0);
+  auto partition = grin_get_partition_from_list(pg, local_partitions, 0);
   vineyard::ArrowFlattenedFragment<property_graph_types::OID_TYPE, property_graph_types::VID_TYPE, int64_t, int64_t>
-    gaf(pg, local_partitions, "value1", "value1");
+    gaf(pg, partition, "value1", "value1");
   auto iv = gaf.InnerVertices();
   for (auto v : iv) {
     auto al = gaf.GetOutgoingAdjList(v);
@@ -66,6 +69,15 @@ std::shared_ptr<arrow::ChunkedArray> makeInt64Array() {
   return arrow::ChunkedArray::Make({out}).ValueOrDie();
 }
 
+std::shared_ptr<arrow::ChunkedArray> makeInt64Array2() {
+  std::vector<int64_t> data = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+  arrow::Int64Builder builder;
+  CHECK_ARROW_ERROR(builder.AppendValues(data));
+  std::shared_ptr<arrow::Array> out;
+  CHECK_ARROW_ERROR(builder.Finish(&out));
+  return arrow::ChunkedArray::Make({out}).ValueOrDie();
+}
+
 std::shared_ptr<arrow::Schema> attachMetadata(
     std::shared_ptr<arrow::Schema> schema, std::string const& key,
     std::string const& value) {
@@ -80,7 +92,7 @@ std::shared_ptr<arrow::Schema> attachMetadata(
 }
 
 std::vector<std::shared_ptr<arrow::Table>> makeVTables() {
-  auto schema = std::make_shared<arrow::Schema>(
+  auto schema1 = std::make_shared<arrow::Schema>(
       std::vector<std::shared_ptr<arrow::Field>>{
           arrow::field("id", arrow::int64()),
           arrow::field("value1", arrow::int64()),
@@ -88,15 +100,27 @@ std::vector<std::shared_ptr<arrow::Table>> makeVTables() {
           arrow::field("value3", arrow::int64()),
           arrow::field("value4", arrow::int64()),
       });
-  schema = attachMetadata(schema, "label", "person");
-  auto table = arrow::Table::Make(
-      schema, {makeInt64Array(), makeInt64Array(), makeInt64Array(),
+  schema1 = attachMetadata(schema1, "label", "person");
+  auto schema2 = std::make_shared<arrow::Schema>(
+      std::vector<std::shared_ptr<arrow::Field>>{
+          arrow::field("id", arrow::int64()),
+          arrow::field("value1", arrow::int64()),
+          arrow::field("value2", arrow::int64()),
+          arrow::field("value3", arrow::int64()),
+          arrow::field("value4", arrow::int64()),
+      });
+  schema2 = attachMetadata(schema2, "label", "post");
+  auto table1 = arrow::Table::Make(
+      schema1, {makeInt64Array(), makeInt64Array(), makeInt64Array(),
                makeInt64Array(), makeInt64Array()});
-  return {table};
+  auto table2 = arrow::Table::Make(
+      schema2, {makeInt64Array2(), makeInt64Array2(), makeInt64Array2(),
+               makeInt64Array2(), makeInt64Array2()});
+  return {table1, table2};
 }
 
 std::vector<std::vector<std::shared_ptr<arrow::Table>>> makeETables() {
-  auto schema = std::make_shared<arrow::Schema>(
+  auto schema1 = std::make_shared<arrow::Schema>(
       std::vector<std::shared_ptr<arrow::Field>>{
           arrow::field("src_id", arrow::int64()),
           arrow::field("dst_id", arrow::int64()),
@@ -105,13 +129,28 @@ std::vector<std::vector<std::shared_ptr<arrow::Table>>> makeETables() {
           arrow::field("value3", arrow::int64()),
           arrow::field("value4", arrow::int64()),
       });
-  schema = attachMetadata(schema, "label", "knows");
-  schema = attachMetadata(schema, "src_label", "person");
-  schema = attachMetadata(schema, "dst_label", "person");
-  auto table = arrow::Table::Make(
-      schema, {makeInt64Array(), makeInt64Array(), makeInt64Array(),
+  schema1 = attachMetadata(schema1, "label", "knows");
+  schema1 = attachMetadata(schema1, "src_label", "person");
+  schema1 = attachMetadata(schema1, "dst_label", "person");
+  auto schema2 = std::make_shared<arrow::Schema>(
+      std::vector<std::shared_ptr<arrow::Field>>{
+          arrow::field("src_id", arrow::int64()),
+          arrow::field("dst_id", arrow::int64()),
+          arrow::field("value1", arrow::int64()),
+          arrow::field("value2", arrow::int64()),
+          arrow::field("value3", arrow::int64()),
+          arrow::field("value4", arrow::int64()),
+      });
+  schema2 = attachMetadata(schema2, "label", "likes");
+  schema2 = attachMetadata(schema2, "src_label", "post");
+  schema2 = attachMetadata(schema2, "dst_label", "post");
+  auto table1 = arrow::Table::Make(
+      schema1, {makeInt64Array(), makeInt64Array(), makeInt64Array(),
                makeInt64Array(), makeInt64Array(), makeInt64Array()});
-  return {{table}};
+  auto table2 = arrow::Table::Make(
+      schema2, {makeInt64Array2(), makeInt64Array2(), makeInt64Array2(),
+               makeInt64Array2(), makeInt64Array2(), makeInt64Array2()});
+  return {{table1, table2}};
 }
 }  // namespace detail
 
