@@ -283,11 +283,86 @@ class VertexRange {
 
   const size_t end_value() const { return end_; }
 
+  const size_t GetVertexLoc(const Vertex& v) const {
+    size_t loc;
+    grin_get_position_of_vertex_from_sorted_list(g_, vl, v.grin_v, loc)
+  }
+
  private:
   GRIN_GRAPH g_;
   GRIN_VERTEX_LIST vl_;
   size_t begin_;
   size_t end_;
+};
+
+template <typename T>
+class VertexArray<T> : public Array<T, Allocator<T>> {
+  using Base = Array<T, Allocator<T>>;
+
+ public:
+  VertexArray() : Base(), fake_start_(NULL) {}
+  explicit VertexArray(const VertexRange& range)
+      : Base(range.size()), range_(range) {
+    fake_start_ = Base::data() - range_.begin_value();
+  }
+  VertexArray(const VertexRange& range, const T& value)
+      : Base(range.size(), value), range_(range) {
+    fake_start_ = Base::data() - range_.begin_value();
+  }
+
+  ~VertexArray() = default;
+
+  void Init(const VertexRange& range) {
+    Base::clear();
+    Base::resize(range.size());
+    range_ = range;
+    fake_start_ = Base::data() - range_.begin_value();
+  }
+
+  void Init(const VertexRange& range, const T& value) {
+    Base::clear();
+    Base::resize(range.size(), value);
+    range_ = range;
+    fake_start_ = Base::data() - range_.begin_value();
+  }
+
+  void SetValue(VertexRange& range, const T& value) {
+    std::fill_n(&Base::data()[range.begin_value() - range_.begin_value()],
+                range.size(), value);
+  }
+  void SetValue(const Vertex& loc, const T& value) {
+    fake_start_[range_.GetVertexLoc(loc)] = value;
+  }
+
+  void SetValue(const T& value) {
+    std::fill_n(Base::data(), Base::size(), value);
+  }
+
+  inline T& operator[](const Vertex& loc) {
+    return fake_start_[range_.GetVertexLoc(loc)];
+  }
+  inline const T& operator[](const Vertex& loc) const {
+    return fake_start_[range_.GetVertexLoc(loc)];
+  }
+
+  void Swap(VertexArray& rhs) {
+    Base::swap((Base&) rhs);
+    range_.Swap(rhs.range_);
+    std::swap(fake_start_, rhs.fake_start_);
+  }
+
+  void Clear() {
+    VertexArray ga;
+    this->Swap(ga);
+  }
+
+  const VertexRange& GetVertexRange() const { return range_; }
+
+ private:
+  void Resize() {}
+
+  VertexRange range_;
+  T* fake_start_;
 };
 }  // namespace arrow_flattened_fragment_impl
 
@@ -323,6 +398,15 @@ class ArrowFlattenedFragment {
 
   using adj_list_t =
       arrow_flattened_fragment_impl::AdjList;
+
+  template <typename DATA_T>
+  using vertex_array_t = arrow_flattened_fragment_impl::VertexArray<vertices_t, DATA_T>;
+
+  template <typename DATA_T>
+  using inner_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<inner_vertices_t, DATA_T>;
+
+  template <typename DATA_T>
+  using outer_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<outer_vertices_t, DATA_T>;
 
   // This member is used by grape::check_load_strategy_compatible()
   static constexpr grape::LoadStrategy load_strategy =
@@ -496,9 +580,7 @@ class ArrowFlattenedFragment {
   inline vid_t GetVerticesNum() const { return tvnum_; }
 
   inline size_t GetTotalVerticesNum() const {
-    return 0;
-    // TODO: apply this to store
-    // return grin_get_total_vertex_num(pg_);
+    return grin_get_total_vertex_num(pg_);
   }
 
   inline size_t GetEdgeNum() const {
