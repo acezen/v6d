@@ -39,6 +39,8 @@
 #include "graph/grin/include/property/propertytable.h"
 #include "graph/grin/include/property/topology.h"
 
+#include "graph/grin/include/index/order.h"
+
 #include "graph/grin/src/predefine.h"
 
 namespace grape {
@@ -285,7 +287,8 @@ class VertexRange {
 
   const size_t GetVertexLoc(const Vertex& v) const {
     size_t loc;
-    grin_get_position_of_vertex_from_sorted_list(g_, vl, v.grin_v, loc)
+    grin_get_position_of_vertex_from_sorted_list(g_, vl_, v.grin_v, loc);
+    return loc;
   }
 
  private:
@@ -296,8 +299,8 @@ class VertexRange {
 };
 
 template <typename T>
-class VertexArray<T> : public Array<T, Allocator<T>> {
-  using Base = Array<T, Allocator<T>>;
+class VertexArray : public grape::Array<T, grape::Allocator<T>> {
+  using Base = grape::Array<T, grape::Allocator<T>>;
 
  public:
   VertexArray() : Base(), fake_start_(NULL) {}
@@ -400,13 +403,13 @@ class ArrowFlattenedFragment {
       arrow_flattened_fragment_impl::AdjList;
 
   template <typename DATA_T>
-  using vertex_array_t = arrow_flattened_fragment_impl::VertexArray<vertices_t, DATA_T>;
+  using vertex_array_t = arrow_flattened_fragment_impl::VertexArray<DATA_T>;
 
   template <typename DATA_T>
-  using inner_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<inner_vertices_t, DATA_T>;
+  using inner_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<DATA_T>;
 
   template <typename DATA_T>
-  using outer_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<outer_vertices_t, DATA_T>;
+  using outer_vertex_array_t = arrow_flattened_fragment_impl::VertexArray<DATA_T>;
 
   // This member is used by grape::check_load_strategy_compatible()
   static constexpr grape::LoadStrategy load_strategy =
@@ -534,21 +537,19 @@ class ArrowFlattenedFragment {
   }
 #endif
 
-/*
-  inline bool Gid2Vertex(const vid_t& gid, vertex_t& v) const {
-    if (fragment_->Gid2Vertex(gid, v)) {
-      v.grin
-      v.SetValue(union_id_parser_.GenerateContinuousLid(v.GetValue()));
-      return true;
+  inline bool Gid2Vertex(const vid_t& v_ref, vertex_t& v) const {
+    auto grin_v = grin_get_vertex_from_vertex_ref(g_, v_ref);
+    if (grin_v == NULL) {
+      return false;
     }
-    return false;
+    v.grin_v = grin_v;
+    v.g_ = g_;
+    return true;
   }
 
   inline vid_t Vertex2Gid(const vertex_t& v) const {
-    vertex_t v_(union_id_parser_.ParseContinuousLid(v.GetValue()));
-    return fragment_->Vertex2Gid(v_);
+    return grin_get_vertex_ref_for_vertex(g_, v.grin_v);
   }
-  */
 
   bool GetData(const vertex_t& v, vdata_t& value) const {
     if (v.grin_v == GRIN_NULL_VERTEX) return false;
@@ -560,6 +561,7 @@ class ArrowFlattenedFragment {
       return true;
     }
 #else
+/*
     if (GRIN_DATATYPE_ENUM<vdata_t>::value != grin_get_vertex_property_data_type(g_, v_prop_)) return false;
     auto vtype = grin_get_vertex_type(g_, v.grin_v);
     auto vpt = grin_get_vertex_property_table_by_type(g_, vtype);
@@ -569,6 +571,7 @@ class ArrowFlattenedFragment {
       value = *(static_cast<vdata_t*>(_value));
       return true;
     }
+    */
 #endif
     return false;
   }
@@ -664,46 +667,118 @@ class ArrowFlattenedFragment {
     return static_cast<int>(sz);
   }
 
-  /*
-  inline dest_list_t IEDests(const vertex_t& v) const {
-    vertex_t v_(union_id_parser_.ParseContinuousLid(v.GetValue()));
-    std::vector<grape::DestList> dest_lists;
-    dest_lists.reserve(fragment_->edge_label_num());
-    for (label_id_t e_label = 0; e_label < fragment_->edge_label_num();
-         e_label++) {
-      dest_lists.push_back(fragment_->IEDests(v_, e_label));
-    }
-    return dest_list_t(dest_lists);
+  inline grape::DestList IEDests(const vertex_t& v) const {
+    auto vl = grin_get_vertex_list(g_);
+    auto ivl = grin_filter_master_for_vertex_list(g_, vl);
+    size_t pos;
+    grin_get_position_of_vertex_from_sorted_list(g_, ivl, v.grin_v, pos);
+
+    return grape::DestList(idoffset_[pos],
+                           idoffset_[pos + 1]);
   }
 
-  inline dest_list_t OEDests(const vertex_t& v) const {
-    vertex_t v_(union_id_parser_.ParseContinuousLid(v.GetValue()));
-    std::vector<grape::DestList> dest_lists;
-    dest_lists.reserve(fragment_->edge_label_num());
-    for (label_id_t e_label = 0; e_label < fragment_->edge_label_num();
-         e_label++) {
-      dest_lists.push_back(fragment_->OEDests(v_, e_label));
-    }
-    return dest_list_t(dest_lists);
+  inline grape::DestList OEDests(const vertex_t& v) const {
+    auto vl = grin_get_vertex_list(g_);
+    auto ivl = grin_filter_master_for_vertex_list(g_, vl);
+    size_t pos;
+    grin_get_position_of_vertex_from_sorted_list(g_, ivl, v.grin_v, pos);
+
+    return grape::DestList(odoffset_[pos],
+                           odoffset_[pos + 1]);
   }
 
-  inline dest_list_t IOEDests(const vertex_t& v) const {
-    vertex_t v_(union_id_parser_.ParseContinuousLid(v.GetValue()));
-    std::vector<grape::DestList> dest_lists;
-    dest_lists.reserve(fragment_->edge_label_num());
-    for (label_id_t e_label = 0; e_label < fragment_->edge_label_num();
-         e_label++) {
-      dest_lists.push_back(fragment_->IOEDests(v_, e_label));
-    }
-    return dest_list_t(dest_lists);
+  inline grape::DestList IOEDests(const vertex_t& v) const {
+    auto vl = grin_get_vertex_list(g_);
+    auto ivl = grin_filter_master_for_vertex_list(g_, vl);
+    size_t pos;
+    grin_get_position_of_vertex_from_sorted_list(g_, ivl, v.grin_v, pos);
+
+    return grape::DestList(iodoffset_[pos],
+                           iodoffset_[pos + 1]);
   }
-  */
+
+  void initDestFidList(
+      bool in_edge, bool out_edge,
+      std::vector<fid_t>& fid_list,
+      std::vector<fid_t*>& fid_list_offset) {
+      auto inner_vertices = InnerVertices();
+      auto ivnum_ = inner_vertices.size();
+
+      auto v = inner_vertices.begin();
+      if (!fid_list_offset.empty()) {
+        return;
+      }
+      fid_list_offset.resize(ivnum_ + 1, NULL);
+      for (auto i = 0; i < ivnum_; ++i) {
+        dstset.clear();
+        if (in_edge) {
+          auto es = GetIncomingAdjList(*v);
+          for (auto& e : es) {
+            auto vref = grin_get_vertex_ref_for_vertex(g_, e.neighbor());
+            auto p = grin_get_master_partition_from_vertex_ref(g_, vref);
+
+            if (!grin_equal_partition(g_, p, partition_)) {
+#ifdef GRIN_TRAIT_NATURAL_ID_FOR_PARTITION
+              auto f = static_cast<unsigned*>(p);
+              dstset.insert(*f);
+#else
+              // todo
+#endif
+            }
+          }
+        }
+        if (out_edge) {
+          auto es = GetOutgoingAdjList(*v, etype);
+          for (auto& e : es) {
+            auto vref = grin_get_vertex_ref_for_vertex(g_, e.neighbor());
+            auto p = grin_get_master_partition_from_vertex_ref(g_, vref);
+
+            if (!grin_equal_partition(g_, p, partition_)) {
+#ifdef GRIN_TRAIT_NATURAL_ID_FOR_PARTITION
+              auto f = static_cast<unsigned*>(p);
+              dstset.insert(*f);
+#else
+              // todo
+#endif
+            }
+          }
+        }
+        id_num[i] = dstset.size();
+        for (auto fid : dstset) {
+          fid_list.push_back(fid);
+        }
+        ++v;
+      }
+
+      fid_list.shrink_to_fit();
+      fid_list_offset[0] = fid_list.data();
+      for (auto i = 0; i < ivnum_; ++i) {
+        fid_list_offset[i + 1] = fid_list_offset[i] + id_num[i];
+      }
+    }
+
+  void PrepareToRunApp(const grape::CommSpec& comm_spec, grape::PrepareConf conf) {
+    if (conf.message_strategy ==
+        grape::MessageStrategy::kAlongEdgeToOuterVertex) {
+      initDestFidList(true, true, iodst_, iodoffset_);
+    } else if (conf.message_strategy ==
+              grape::MessageStrategy::kAlongIncomingEdgeToOuterVertex) {
+      initDestFidList(true, false, idst_, idoffset_);
+    } else if (conf.message_strategy ==
+              grape::MessageStrategy::kAlongOutgoingEdgeToOuterVertex) {
+      initDestFidList(false, true, odst_, odoffset_);
+    }
+  }
 
  private:
   GRIN_PARTITIONED_GRAPH pg_;
   GRIN_GRAPH g_;
   GRIN_PARTITION partition_;
   std::string v_prop_, e_prop_;
+
+  std::vector<fid_t> idst_, odst_, iodst_;
+  std::vector<fid_t*> idoffset_, odoffset_,
+      iodoffset_;
 
   vid_t ivnum_;
   vid_t ovnum_;
