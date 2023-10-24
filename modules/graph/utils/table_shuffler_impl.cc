@@ -77,6 +77,7 @@ void SendArrowArray<arrow::ChunkedArray>(
 
   // length
   int64_t length = array->length();
+  // LOG(INFO) << "Send array length to " << dst_worker_id << " length: " << length;
   MPI_Send(&length, 1, MPI_INT64_T, dst_worker_id, tag, comm);
 
   // chunk_size
