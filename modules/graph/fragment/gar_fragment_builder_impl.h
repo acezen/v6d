@@ -148,10 +148,12 @@ boost::leaf::result<void> generate_csr(
              offset_array->length() * sizeof(int64_t));
       // we do not store the edge offset of outer vertices, so fill edge_num
       // to the outer vertices offset
-      std::fill_n(
-          reinterpret_cast<int64_t*>(offsets_buffer->mutable_data() +
-                                     offset_array->length() * sizeof(int64_t)),
-          (tvnum + 1) - offset_array->length(), edge_num);
+      if (offset_array->length() < tvnum + 1) {
+        std::fill_n(
+            reinterpret_cast<int64_t*>(offsets_buffer->mutable_data() +
+                                       offset_array->length() * sizeof(int64_t)),
+            (tvnum + 1) - offset_array->length(), edge_num);
+      } 
       edges[v_label] =
           std::make_shared<PodArrayBuilder<nbr_unit_t>>(client, edge_num);
     } else {
