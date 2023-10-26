@@ -89,6 +89,15 @@ class ArrowFragmentWriter {
   ArrowFragmentWriter(const std::shared_ptr<fragment_t>& frag,
                       const grape::CommSpec& comm_spec,
                       const std::string& graph_info_yaml);
+  ArrowFragmentWriter(const std::shared_ptr<fragment_t>& frag,
+                      const grape::CommSpec& comm_spec,
+                      const std::string& graph_name,
+                      const std::string& path,
+                      int64_t vertex_block_size,
+                      int64_t edge_block_size,
+                      const std::string& file_type,
+                      bool store_in_local);
+
 
   ~ArrowFragmentWriter() = default;
 
@@ -106,7 +115,7 @@ class ArrowFragmentWriter {
 
  private:
   boost::leaf::result<void> writeEdgeImpl(
-      const GraphArchive::EdgeInfo& edge_info, label_id_t src_label_id,
+      const std::shared_ptr<GraphArchive::EdgeInfo>& edge_info, label_id_t src_label_id,
       label_id_t edge_label_id, label_id_t dst_label_id,
       const std::vector<int64_t>& main_start_chunk_indices,
       const std::vector<int64_t>& another_start_chunk_indices,
@@ -122,6 +131,8 @@ class ArrowFragmentWriter {
   grape::CommSpec comm_spec_;
   std::shared_ptr<GraphArchive::GraphInfo> graph_info_;
   std::map<label_id_t, int64_t> label_id_to_vnum_;
+
+  bool store_in_local_;
 };
 
 }  // namespace vineyard

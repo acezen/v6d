@@ -119,7 +119,7 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/powturbo/include"
 
 if(BUILD_VINEYARD_GRAPH_WITH_GAR)
     target_compile_definitions(vineyard_graph PUBLIC -DENABLE_GAR)
-    find_package(gar QUIET)
+    find_package(gar 0.11.1 QUIET)
     if (gar_FOUND)
         message(STATUS "-- Found GraphAr: ${GAR_LIBRARIES}")
         target_include_directories(vineyard_graph PRIVATE ${GAR_INCLUDE_DIRS})
@@ -181,6 +181,7 @@ if(BUILD_VINEYARD_TESTS)
         endif()
         target_link_libraries(${T_NAME} PRIVATE
                               vineyard_graph
+                              vineyard_io
                               ${ARROW_SHARED_LIB}
                               ${MPI_CXX_LIBRARIES})
         if(${LIBUNWIND_FOUND})

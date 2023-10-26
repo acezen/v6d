@@ -219,6 +219,7 @@ int main(int argc, char** argv) {
     grape::CommSpec comm_spec;
     comm_spec.Init(MPI_COMM_WORLD);
 
+
     {
       auto loader =
           std::make_unique<ArrowFragmentLoader<property_graph_types::OID_TYPE,

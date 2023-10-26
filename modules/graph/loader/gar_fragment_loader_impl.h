@@ -18,14 +18,18 @@ limitations under the License.
 
 #ifdef ENABLE_GAR
 
+#include <fstream>
 #include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "gar/graph_info.h"
+#include "gar/util/adj_list_type.h"
 #include "gar/reader/arrow_chunk_reader.h"
 #include "gar/util/general_params.h"
+#include "arrow/filesystem/api.h"
 
 #include "graph/fragment/property_graph_utils.h"
 #include "graph/fragment/property_graph_utils_impl.h"
@@ -47,19 +51,20 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::GARFragmentLoader(
     Client& client, const grape::CommSpec& comm_spec,
-    const std::string& graph_info_yaml, bool directed, bool generate_eid)
+    const std::string& graph_info_yaml, bool directed, bool generate_eid,
+    bool store_in_local)
     : client_(client),
       comm_spec_(comm_spec),
       directed_(directed),
-      generate_eid_(generate_eid) {
+      generate_eid_(generate_eid),
+      store_in_local_(store_in_local) {
   // Load graph info.
   auto maybe_graph_info = GraphArchive::GraphInfo::Load(graph_info_yaml);
   if (!maybe_graph_info.status().ok()) {
     LOG(ERROR) << "Failed to load graph info from " << graph_info_yaml
                << ", error: " << maybe_graph_info.status().message();
   }
-  graph_info_ = std::make_shared<GraphArchive::GraphInfo>(
-      std::move(maybe_graph_info.value()));
+  graph_info_ = maybe_graph_info.value();
 }
 
 template <typename OID_T, typename VID_T,
@@ -131,15 +136,14 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::LoadEdgeTables() {
   csr_edge_tables_with_label_.resize(edge_label_num_);
   csc_edge_tables_with_label_.resize(edge_label_num_);
   // read the adj list chunk tables
-  for (const auto& edge : graph_info_->GetEdgeInfos()) {
-    const auto& edge_info = edge.second;
-    if (edge_info.ContainAdjList(
+  for (const auto& edge_info : graph_info_->GetEdgeInfos()) {
+    if (edge_info->HasAdjacentListType(
             GraphArchive::AdjListType::ordered_by_source)) {
       loadEdgeTableOfLabel(edge_info,
                            GraphArchive::AdjListType::ordered_by_source);
     }
     if (this->directed_) {
-      if (edge_info.ContainAdjList(
+      if (edge_info->HasAdjacentListType(
               GraphArchive::AdjListType::ordered_by_dest)) {
         loadEdgeTableOfLabel(edge_info,
                              GraphArchive::AdjListType::ordered_by_dest);
@@ -193,37 +197,64 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 boost::leaf::result<void>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::distributeVertices() {
-  for (const auto& item : graph_info_->GetVertexInfos()) {
-    const auto& label = item.first;
-    const auto& vertex_info = item.second;
-    if (std::find(vertex_labels_.begin(), vertex_labels_.end(), label) !=
-        vertex_labels_.end()) {
-      continue;
-    }
+  vertex_chunk_begins_.resize(graph_info_->VertexInfoNum(), 0);
+  vertex_chunk_nums_.resize(graph_info_->VertexInfoNum(), 0);
+  for (int i = 0; i < graph_info_->VertexInfoNum(); ++i) {
+    const auto& vertex_info = graph_info_->GetVertexInfoByIndex(i);
+    const auto& label = vertex_info->GetLabel();
     vertex_labels_.push_back(label);
-    vertex_chunk_sizes_.push_back(vertex_info.GetChunkSize());
-    auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
-        graph_info_->GetPrefix(), vertex_info);
-    RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
-    // distribute the vertex chunks for fragments
-    auto chunk_num = chunk_num_result.value();
+    vertex_chunk_sizes_.push_back(vertex_info->GetChunkSize());
+    if (store_in_local_) {
+      // distribute the vertex chunks base on the local metadata
+      std::string path = graph_info_->GetPrefix() + vertex_info->GetPrefix() + "metadata_" + std::to_string(comm_spec_.fid());
 
-    if (chunk_num < static_cast<int64_t>(comm_spec_.fnum())) {
-      int64_t index = 0;
-      for (; index < chunk_num; ++index) {
-        vertex_chunk_begin_of_frag_[label][index] = index;
+      std::shared_ptr<arrow::io::ReadableFile> file;
+      std::shared_ptr<arrow::fs::FileSystem> fs;
+
+      auto fs_result = arrow::fs::FileSystemFromUriOrPath(path);
+      if (!fs_result.ok()) {
+        RETURN_GS_ERROR(ErrorCode::kArrowError, fs_result.status().message());
       }
-      for (; index <= static_cast<int64_t>(comm_spec_.fnum()); ++index) {
-        vertex_chunk_begin_of_frag_[label][index] = chunk_num;
+      fs = fs_result.ValueOrDie();
+      auto input_stream_result = fs-> OpenInputStream(path);
+      if (!input_stream_result.status().ok()) {
+        RETURN_GS_ERROR(ErrorCode::kArrowError, input_stream_result.status().message());
       }
+      auto input_stream = input_stream_result.ValueOrDie();
+      auto read_result = input_stream->Read(sizeof(int64_t), &vertex_chunk_begins_[i]);
+      if (!read_result.ok()) {
+        RETURN_GS_ERROR(ErrorCode::kArrowError, read_result.status().message());
+      }
+      assert(read_result.ValueOrDie() == sizeof(int64_t));
+      read_result = input_stream->Read(sizeof(int64_t), &vertex_chunk_nums_[i]);
+      if (!read_result.ok()) {
+        RETURN_GS_ERROR(ErrorCode::kArrowError, read_result.status().message());
+      }
+      assert(read_result.ValueOrDie() == sizeof(int64_t));
     } else {
-      int64_t bsize = chunk_num / static_cast<int64_t>(comm_spec_.fnum());
-      vertex_chunk_begin_of_frag_[label].resize(comm_spec_.fnum() + 1, 0);
-      for (fid_t fid = 0; fid < comm_spec_.fnum(); ++fid) {
-        vertex_chunk_begin_of_frag_[label][fid] =
-            static_cast<gar_id_t>(fid) * bsize;
+      // distribute the vertex chunks for fragments
+      auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
+          graph_info_->GetPrefix(), vertex_info);
+      RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
+      auto chunk_num = chunk_num_result.value();
+
+      if (chunk_num <= static_cast<int64_t>(comm_spec_.fnum())) {
+        if (chunk_num < comm_spec_.fid() + 1) {
+          vertex_chunk_begins_[i] = 0;
+          vertex_chunk_nums_[i] = 0;
+        } else  {
+          vertex_chunk_begins_[i] = static_cast<int64_t>(comm_spec_.fid());
+          vertex_chunk_nums_[i] = 1;
+        }
+      } else {
+        int64_t bsize = chunk_num / static_cast<int64_t>(comm_spec_.fnum());
+        vertex_chunk_begins_[i] = static_cast<int64_t>(comm_spec_.fid()) * bsize;
+        if (comm_spec_.fid() == comm_spec_.fnum() - 1) {
+          vertex_chunk_nums_[i] = chunk_num - vertex_chunk_begins_[i];
+        } else {
+          vertex_chunk_nums_[i] = bsize;
+        }
       }
-      vertex_chunk_begin_of_frag_[label][comm_spec_.fnum()] = chunk_num;
     }
   }
   vertex_label_num_ = vertex_labels_.size();
@@ -231,12 +262,11 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::distributeVertices() {
     vertex_label_to_index_[vertex_labels_[i]] = i;
   }
 
-  for (const auto& item : graph_info_->GetEdgeInfos()) {
-    auto& edge_info = item.second;
+  for (const auto& edge_info : graph_info_->GetEdgeInfos()) {
     // record edge label
-    const auto& edge_label = edge_info.GetEdgeLabel();
-    const auto& src_label = edge_info.GetSrcLabel();
-    const auto& dst_label = edge_info.GetDstLabel();
+    const auto& edge_label = edge_info->GetEdgeLabel();
+    const auto& src_label = edge_info->GetSrcLabel();
+    const auto& dst_label = edge_info->GetDstLabel();
     auto it = std::find(edge_labels_.begin(), edge_labels_.end(), edge_label);
     if (it == edge_labels_.end()) {
       edge_labels_.push_back(edge_label);
@@ -261,31 +291,12 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::constructVertexMap() {
   auto shuffle_procedure =
       [&](const label_id_t label_id) -> boost::leaf::result<std::nullptr_t> {
     std::vector<std::shared_ptr<arrow::ChunkedArray>> shuffled_oid_array;
-    auto& vertex_info =
-        graph_info_->GetVertexInfo(vertex_labels_[label_id]).value();
-    const auto& property_groups = vertex_info.GetPropertyGroups();
-    std::string primary_key;
-    for (const auto& pg : property_groups) {
-      for (const auto& prop : pg.GetProperties()) {
-        if (prop.is_primary) {
-          primary_key = prop.name;
-          break;
-        }
-      }
-      if (!primary_key.empty()) {
-        break;
-      }
-    }
-    if (primary_key.empty()) {
-      std::string msg = "primary key is not found in " +
-                        vertex_labels_[label_id] + " property groups";
-      RETURN_GS_ERROR(ErrorCode::kInvalidValueError, msg);
-    }
+    const auto& vertex_info =
+        graph_info_->GetVertexInfo(vertex_labels_[label_id]);
     auto local_oid_array =
-        vertex_tables_[label_id]->GetColumnByName(primary_key);
+        vertex_tables_[label_id]->GetColumnByName(GraphArchive::GeneralParams::kVertexIndexCol);
     if (local_oid_array == nullptr) {
-      std::string msg = "primary key column " + primary_key +
-                        " is not found in " + vertex_labels_[label_id] +
+      std::string msg = "vertex index column is not found in " + vertex_labels_[label_id] +
                         " table";
       RETURN_GS_ERROR(ErrorCode::kInvalidValueError, msg);
     }
@@ -314,18 +325,12 @@ template <typename OID_T, typename VID_T,
 boost::leaf::result<void>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
     const std::string& vertex_label) {
-  auto maybe_vertex_info = graph_info_->GetVertexInfo(vertex_label);
-  RETURN_GS_ERROR_IF_NOT_OK(maybe_vertex_info.status());
-  auto& vertex_info = maybe_vertex_info.value();
-  const auto& label = vertex_info.GetLabel();
-  label_id_t label_id = vertex_label_to_index_[label];
-  auto vertex_chunk_begin =
-      vertex_chunk_begin_of_frag_[label][comm_spec_.fid()];
-  auto vertex_chunk_num_of_fragment =
-      vertex_chunk_begin_of_frag_[label][comm_spec_.fid() + 1] -
-      vertex_chunk_begin_of_frag_[label][comm_spec_.fid()];
-  auto chunk_size = vertex_info.GetChunkSize();
-  const auto& property_groups = vertex_info.GetPropertyGroups();
+  auto vertex_info = graph_info_->GetVertexInfo(vertex_label);
+  label_id_t label_id = vertex_label_to_index_[vertex_label];
+  auto vertex_chunk_begin = vertex_chunk_begins_[label_id];
+  auto vertex_chunk_num_of_fragment = vertex_chunk_nums_[label_id];
+  auto chunk_size = vertex_info->GetChunkSize();
+  const auto& property_groups = vertex_info->GetPropertyGroups();
 
   table_vec_t pg_tables;
   int64_t thread_num =
@@ -340,8 +345,8 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
     for (int64_t i = 0; i < thread_num; ++i) {
       threads[i] = std::thread([&]() -> boost::leaf::result<void> {
         auto maybe_reader =
-            GraphArchive::ConstructVertexPropertyArrowChunkReader(
-                *(graph_info_.get()), label, pg);
+            GraphArchive::VertexPropertyArrowChunkReader::Make(
+                vertex_info, pg, graph_info_->GetPrefix());
         RETURN_GS_ERROR_IF_NOT_OK(maybe_reader.status());
         auto& reader = maybe_reader.value();
         while (true) {
@@ -354,10 +359,15 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
           int64_t iter = begin;
           while (iter != end) {
             RETURN_GS_ERROR_IF_NOT_OK(
-                reader.seek((vertex_chunk_begin + iter) * chunk_size));
-            auto chunk_table = reader.GetChunk();
+                reader->seek((vertex_chunk_begin + iter) * chunk_size));
+            auto chunk_table = reader->GetChunk();
             RETURN_GS_ERROR_IF_NOT_OK(chunk_table.status());
             vertex_chunk_tables[iter] = chunk_table.value();
+            if (vertex_chunk_tables[iter]->num_rows() == 0) {
+              LOG(FATAL) << "vertex chunk table is empty, vertex label: "
+                         << vertex_label << ", chunk id: "
+                         << vertex_chunk_begin + iter;
+            }
             ++iter;
           }
         }
@@ -394,7 +404,7 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
   std::shared_ptr<arrow::Table> table_out;
   VY_OK_OR_RAISE(CastTableToSchema(concat_table, normalized_schema, table_out));
   auto metadata = std::make_shared<arrow::KeyValueMetadata>();
-  metadata->Append("label", label);
+  metadata->Append("label", vertex_label);
   metadata->Append("label_id", std::to_string(label_id));
   metadata->Append("type", PropertyGraphSchema::VERTEX_TYPE_NAME);
   metadata->Append("retain_oid", std::to_string(false));
@@ -406,32 +416,25 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 boost::leaf::result<void>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
-    const GraphArchive::EdgeInfo& edge_info,
+    const std::shared_ptr<GraphArchive::EdgeInfo>& edge_info,
     GraphArchive::AdjListType adj_list_type) {
-  auto src_label = edge_info.GetSrcLabel();
-  auto dst_label = edge_info.GetDstLabel();
-  auto edge_label = edge_info.GetEdgeLabel();
-  const auto& property_groups =
-      edge_info.GetPropertyGroups(adj_list_type).value();
+  auto src_label = edge_info->GetSrcLabel();
+  auto dst_label = edge_info->GetDstLabel();
+  auto edge_label = edge_info->GetEdgeLabel();
+  const auto& property_groups = edge_info->GetPropertyGroups();
 
   int64_t vertex_chunk_begin = 0;
   int64_t vertex_chunk_num_of_fragment = 0;
-  int64_t edge_chunk_size = edge_info.GetChunkSize();
+  int64_t edge_chunk_size = edge_info->GetChunkSize();
   int64_t vertex_chunk_size;
   if (adj_list_type == GraphArchive::AdjListType::ordered_by_source) {
-    vertex_chunk_begin =
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid()];
-    vertex_chunk_num_of_fragment =
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid() + 1] -
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid()];
-    vertex_chunk_size = edge_info.GetSrcChunkSize();
+    vertex_chunk_begin = vertex_chunk_begins_[vertex_label_to_index_[src_label]];
+    vertex_chunk_num_of_fragment = vertex_chunk_nums_[vertex_label_to_index_[src_label]];
+    vertex_chunk_size = edge_info->GetSrcChunkSize();
   } else {
-    vertex_chunk_begin =
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid()];
-    vertex_chunk_num_of_fragment =
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid() + 1] -
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid()];
-    vertex_chunk_size = edge_info.GetDstChunkSize();
+    vertex_chunk_begin = vertex_chunk_begins_[vertex_label_to_index_[dst_label]];
+    vertex_chunk_num_of_fragment = vertex_chunk_nums_[vertex_label_to_index_[dst_label]];
+    vertex_chunk_size = edge_info->GetDstChunkSize();
   }
   std::vector<std::shared_ptr<arrow::Int64Array>> offset_arrays(
       vertex_chunk_num_of_fragment);
@@ -449,11 +452,10 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   for (int64_t i = 0; i < thread_num; ++i) {
     threads[i] = std::thread([&]() -> boost::leaf::result<void> {
       auto maybe_offset_reader =
-          GraphArchive::ConstructAdjListOffsetArrowChunkReader(
-              *(graph_info_.get()), src_label, edge_label, dst_label,
-              adj_list_type);
+          GraphArchive::AdjListOffsetArrowChunkReader::Make(
+              edge_info, adj_list_type, graph_info_->GetPrefix());
       RETURN_GS_ERROR_IF_NOT_OK(maybe_offset_reader.status());
-      auto& offset_reader = maybe_offset_reader.value();
+      auto offset_reader = maybe_offset_reader.value();
       while (true) {
         int64_t begin = cur_chunk.fetch_add(batch_size);
         if (begin >= vertex_chunk_num_of_fragment) {
@@ -465,8 +467,8 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
         while (iter != end) {
           int64_t vertex_chunk_id = iter + vertex_chunk_begin;
           RETURN_GS_ERROR_IF_NOT_OK(
-              offset_reader.seek(vertex_chunk_id * vertex_chunk_size));
-          auto offset_result = offset_reader.GetChunk();
+              offset_reader->seek(vertex_chunk_id * vertex_chunk_size));
+          auto offset_result = offset_reader->GetChunk();
           RETURN_GS_ERROR_IF_NOT_OK(offset_result.status());
           offset_arrays[iter] = std::dynamic_pointer_cast<arrow::Int64Array>(
               offset_result.value());
@@ -500,24 +502,25 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
 
   auto total_edge_chunk_num = agg_edge_chunk_num.back();
   table_vec_t edge_chunk_tables(total_edge_chunk_num);
-  std::vector<table_vec_t> edge_property_chunk_tables(property_groups.size());
-  for (size_t i = 0; i < property_groups.size(); ++i) {
+  std::vector<table_vec_t> edge_property_chunk_tables(edge_info->PropertyGroupNum());
+  for (int i = 0; i < edge_info->PropertyGroupNum(); ++i) {
     edge_property_chunk_tables[i].resize(total_edge_chunk_num);
   }
   std::atomic<int64_t> cur(0);
   batch_size = (total_edge_chunk_num + thread_num - 1) / thread_num;
   for (int64_t i = 0; i < thread_num; ++i) {
     threads[i] = std::thread([&]() -> boost::leaf::result<void> {
-      auto expect = GraphArchive::ConstructAdjListArrowChunkReader(
-          *(graph_info_.get()), src_label, edge_label, dst_label,
-          adj_list_type);
+      auto expect = GraphArchive::AdjListArrowChunkReader::Make(
+          edge_info, adj_list_type, graph_info_->GetPrefix());
       RETURN_GS_ERROR_IF_NOT_OK(expect.status());
-      auto& reader = expect.value();
-      std::vector<GraphArchive::AdjListPropertyArrowChunkReader>
+      auto reader = expect.value();
+      std::vector<std::shared_ptr<GraphArchive::AdjListPropertyArrowChunkReader>>
           property_readers;
       for (const auto& pg : property_groups) {
-        property_readers.emplace_back(edge_info, pg, adj_list_type,
-                                      graph_info_->GetPrefix());
+        auto maybe_pg_reader = GraphArchive::AdjListPropertyArrowChunkReader::Make(
+            edge_info, pg, adj_list_type, graph_info_->GetPrefix());
+        RETURN_GS_ERROR_IF_NOT_OK(maybe_pg_reader.status());
+        property_readers.emplace_back(maybe_pg_reader.value());
       }
       while (true) {
         int64_t begin = cur.fetch_add(batch_size);
@@ -534,15 +537,15 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
           auto vertex_chunk_id = chunk_pair.first + vertex_chunk_begin;
           auto edge_chunk_index = chunk_pair.second;
           RETURN_GS_ERROR_IF_NOT_OK(
-              reader.seek_chunk_index(vertex_chunk_id, edge_chunk_index));
-          auto edge_chunk_result = reader.GetChunk();
+              reader->seek_chunk_index(vertex_chunk_id, edge_chunk_index));
+          auto edge_chunk_result = reader->GetChunk();
           RETURN_GS_ERROR_IF_NOT_OK(edge_chunk_result.status());
           edge_chunk_tables[iter] = edge_chunk_result.value();
           for (size_t j = 0; j < property_groups.size(); ++j) {
             auto& pg_reader = property_readers[j];
             RETURN_GS_ERROR_IF_NOT_OK(
-                pg_reader.seek_chunk_index(vertex_chunk_id, edge_chunk_index));
-            auto pg_result = pg_reader.GetChunk();
+                pg_reader->seek_chunk_index(vertex_chunk_id, edge_chunk_index));
+            auto pg_result = pg_reader->GetChunk();
             RETURN_GS_ERROR_IF_NOT_OK(pg_result.status());
             edge_property_chunk_tables[j][iter] = pg_result.value();
           }
@@ -559,6 +562,7 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   auto adj_list_table = arrow::ConcatenateTables(edge_chunk_tables);
   RETURN_GS_ERROR_IF_NOT_OK(adj_list_table.status());
   std::shared_ptr<arrow::Table> adj_list_table_with_gid;
+  // internal id to global id
   BOOST_LEAF_ASSIGN(
       adj_list_table_with_gid,
       parseEdgeIdArrays(std::move(adj_list_table).ValueOrDie(),
@@ -743,24 +747,23 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::parseIdChunkedArrayChunk(
   }
 
   vid_t* builder = reinterpret_cast<vid_t*>(buffer->mutable_data());
-  const auto& label_name = vertex_labels_[label_id];
   const gar_id_t* ids =
       reinterpret_cast<const gar_id_t*>(id_array->raw_values());
   if (all_be_local_vertex) {
-    gar_id_t start_id =
-        vertex_chunk_begin_of_frag_[label_name][comm_spec_.fid()] *
-        vertex_chunk_sizes_[label_id];
+    gar_id_t start_id = vertex_chunk_begins_[label_id] * vertex_chunk_sizes_[label_id];
     for (int64_t k = 0; k != id_array->length(); ++k) {
       builder[k] =
           vid_parser_.GenerateId(comm_spec_.fid(), label_id, ids[k] - start_id);
     }
   } else {
+    vid_t gid = 0;
     for (int64_t k = 0; k != id_array->length(); ++k) {
-      fid_t fid = getPartitionId(ids[k], label_id);
-      builder[k] = vid_parser_.GenerateId(
-          fid, label_id,
-          ids[k] - vertex_chunk_begin_of_frag_[label_name][fid] *
-                       vertex_chunk_sizes_[label_id]);
+      if (vm_ptr_->GetGid(label_id, ids[k], gid)) {
+        builder[k] = gid;
+      } else {
+        LOG(WARNING) << "vertex " << ids[k] << " is not found in fragment "
+                     << comm_spec_.fid();
+      }
     }
   }
   out = std::make_shared<ArrowArrayType<VID_T>>(

@@ -51,7 +51,7 @@ enum class AdjListType : std::uint8_t;
 namespace vineyard {
 
 std::shared_ptr<arrow::Schema> ConstructSchemaFromPropertyGroup(
-    const GraphArchive::PropertyGroup& property_group);
+    const std::shared_ptr<GraphArchive::PropertyGroup>& property_group);
 
 template <typename OID_T = property_graph_types::OID_TYPE,
           typename VID_T = property_graph_types::VID_TYPE,
@@ -88,7 +88,7 @@ class GARFragmentLoader {
    */
   GARFragmentLoader(Client& client, const grape::CommSpec& comm_spec,
                     const std::string& graph_info_yaml, bool directed = true,
-                    bool generate_eid = false);
+                    bool generate_eid = false, bool store_in_local = false);
 
   ~GARFragmentLoader() = default;
 
@@ -111,7 +111,7 @@ class GARFragmentLoader {
       const std::string& vertex_label);
 
   boost::leaf::result<void> loadEdgeTableOfLabel(
-      const GraphArchive::EdgeInfo& edge_info,
+      const std::shared_ptr<GraphArchive::EdgeInfo>& edge_info,
       GraphArchive::AdjListType adj_list_type);
 
   boost::leaf::result<void> initSchema(PropertyGraphSchema& schema);
@@ -177,6 +177,10 @@ class GARFragmentLoader {
 
   bool generate_eid_;
   IdParser<vid_t> vid_parser_;
+
+  bool store_in_local_;
+  std::vector<int64_t> vertex_chunk_begins_;
+  std::vector<int64_t> vertex_chunk_nums_;
 };
 
 namespace detail {
