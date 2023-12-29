@@ -367,9 +367,12 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     // write the offset chunks
     if (adj_list_type == GraphArchive::AdjListType::ordered_by_source ||
         adj_list_type == GraphArchive::AdjListType::ordered_by_dest) {
-      while (distance % main_vertex_chunk_size != 0) {
-        RETURN_ON_ARROW_ERROR(offset_builder.Append(edge_offset));
-        ++distance;
+      if (frag_->fid() != frag_->fnum() - 1) {
+        // not the last fragment, align the offset chunk size
+        while (distance % main_vertex_chunk_size != 0) {
+          RETURN_ON_ARROW_ERROR(offset_builder.Append(edge_offset));
+          ++distance;
+        }
       }
       RETURN_ON_ARROW_ERROR(
           offset_builder.Append(edge_offset));  // append the last offset

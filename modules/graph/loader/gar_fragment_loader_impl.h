@@ -58,8 +58,7 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::GARFragmentLoader(
     LOG(ERROR) << "Failed to load graph info from " << graph_info_yaml
                << ", error: " << maybe_graph_info.status().message();
   }
-  graph_info_ = std::make_shared<GraphArchive::GraphInfo>(
-      std::move(maybe_graph_info.value()));
+  graph_info_ = maybe_graph_info.value();
 }
 
 template <typename OID_T, typename VID_T,
@@ -193,15 +192,11 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 boost::leaf::result<void>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::distributeVertices() {
-  for (const auto& item : graph_info_->GetVertexInfos()) {
-    const auto& label = item.first;
-    const auto& vertex_info = item.second;
-    if (std::find(vertex_labels_.begin(), vertex_labels_.end(), label) !=
-        vertex_labels_.end()) {
-      continue;
-    }
+  
+  for (const auto& vertex_info  : graph_info_->GetVertexInfos()) {
+    const auto& label = vertex_info->GetLabel();
     vertex_labels_.push_back(label);
-    vertex_chunk_sizes_.push_back(vertex_info.GetChunkSize());
+    vertex_chunk_sizes_.push_back(vertex_info->GetChunkSize());
     auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
         graph_info_->GetPrefix(), vertex_info);
     RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
