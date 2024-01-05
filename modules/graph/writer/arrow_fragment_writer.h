@@ -106,7 +106,7 @@ class ArrowFragmentWriter {
 
  private:
   boost::leaf::result<void> writeEdgeImpl(
-      const GraphArchive::EdgeInfo& edge_info, label_id_t src_label_id,
+      const std::shared_ptr<GraphArchive::EdgeInfo>& edge_info, label_id_t src_label_id,
       label_id_t edge_label_id, label_id_t dst_label_id,
       const std::vector<int64_t>& main_start_chunk_indices,
       const std::vector<int64_t>& another_start_chunk_indices,

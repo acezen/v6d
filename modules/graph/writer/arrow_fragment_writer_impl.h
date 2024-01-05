@@ -33,6 +33,8 @@
 #include "boost/leaf/result.hpp"
 #include "gar/graph_info.h"
 #include "gar/writer/arrow_chunk_writer.h"
+#include "gar/util/adj_list_type.h"
+#include "gar/util/general_params.h"
 #include "grape/worker/comm_spec.h"
 
 #include "basic/ds/arrow_utils.h"
@@ -57,8 +59,7 @@ ArrowFragmentWriter<FRAG_T>::ArrowFragmentWriter(
   if (!maybe_graph_info.status().ok()) {
     LOG(ERROR) << "Failed to load graph info from " << graph_info_yaml;
   }
-  graph_info_ = std::make_shared<GraphArchive::GraphInfo>(
-      std::move(maybe_graph_info.value()));
+  graph_info_ = maybe_graph_info.value();
 }
 
 template <typename FRAG_T>
@@ -71,8 +72,8 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteFragment() {
 
 template <typename FRAG_T>
 boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertices() {
-  for (auto& item : graph_info_->GetVertexInfos()) {
-    std::string label = item.first;
+  for (const auto& vertex_info : graph_info_->GetVertexInfos()) {
+    const auto& label = vertex_info->GetLabel();
     BOOST_LEAF_CHECK(WriteVertex(label));
   }
   return {};
@@ -81,12 +82,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertices() {
 template <typename FRAG_T>
 boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
     const std::string& label) {
-  auto maybe_vertex_info = graph_info_->GetVertexInfo(label);
-  if (maybe_vertex_info.has_error()) {
-    RETURN_GS_ERROR(ErrorCode::kGraphArError,
-                    maybe_vertex_info.status().message());
-  }
-  auto& vertex_info = maybe_vertex_info.value();
+  auto vertex_info = graph_info_->GetVertexInfo(label);
 
   auto& schema = frag_->schema();
   auto label_id = schema.GetVertexLabelId(label);
@@ -101,31 +97,32 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
   for (fid_t fid = 0; fid < frag_->fid(); ++fid) {
     chunk_index_begin += static_cast<GraphArchive::IdType>(
         std::ceil(vm_ptr->GetInnerVertexSize(fid, label_id) /
-                  static_cast<double>(vertex_info.GetChunkSize())));
+                  static_cast<double>(vertex_info->GetChunkSize())));
   }
-  GraphArchive::VertexPropertyWriter writer(vertex_info,
-                                            graph_info_->GetPrefix());
+  auto maybe_writer = GraphArchive::VertexPropertyWriter::Make(vertex_info,
+                                                         graph_info_->GetPrefix());
+  auto writer = maybe_writer.value();
   // write vertex data start from chunk index begin
   auto vertex_table = frag_->vertex_data_table(label_id);
   auto num_rows = vertex_table->num_rows();
   if (frag_->fid() != frag_->fnum() - 1 &&
-      num_rows % vertex_info.GetChunkSize() != 0) {
+      num_rows % vertex_info->GetChunkSize() != 0) {
     // Append nulls if the number of rows is not a multiple of chunk size.
     vertex_table = AppendNullsToArrowTable(
         vertex_table,
-        vertex_info.GetChunkSize() - num_rows % vertex_info.GetChunkSize());
+        vertex_info->GetChunkSize() - num_rows % vertex_info->GetChunkSize());
   }
-  auto st = writer.WriteTable(vertex_table, chunk_index_begin);
+  auto st = writer->WriteTable(vertex_table, chunk_index_begin);
   if (!st.ok()) {
     RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
   }
 
   if (frag_->fid() == frag_->fnum() - 1) {
     // write vertex number
-    auto total_vertices_num = chunk_index_begin * vertex_info.GetChunkSize() +
+    auto total_vertices_num = chunk_index_begin * vertex_info->GetChunkSize() +
                               vertex_table->num_rows();
     label_id_to_vnum_[label_id] = total_vertices_num;
-    auto st = writer.WriteVerticesNum(total_vertices_num);
+    auto st = writer->WriteVerticesNum(total_vertices_num);
     if (!st.ok()) {
       RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
     }
@@ -136,10 +133,10 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
 
 template <typename FRAG_T>
 boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteEdges() {
-  for (auto& item : graph_info_->GetEdgeInfos()) {
-    const auto src_label = item.second.GetSrcLabel();
-    const auto edge_label = item.second.GetEdgeLabel();
-    const auto dst_label = item.second.GetDstLabel();
+  for (const auto& edge_info : graph_info_->GetEdgeInfos()) {
+    const auto& src_label = edge_info->GetSrcLabel();
+    const auto& edge_label = edge_info->GetEdgeLabel();
+    const auto& dst_label = edge_info->GetDstLabel();
     BOOST_LEAF_CHECK(WriteEdge(src_label, edge_label, dst_label));
   }
   return {};
@@ -149,13 +146,8 @@ template <typename FRAG_T>
 boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteEdge(
     const std::string& src_label, const std::string& edge_label,
     const std::string& dst_label) {
-  auto maybe_edge_info =
+  auto edge_info =
       graph_info_->GetEdgeInfo(src_label, edge_label, dst_label);
-  if (maybe_edge_info.has_error()) {
-    RETURN_GS_ERROR(ErrorCode::kGraphArError,
-                    maybe_edge_info.status().message());
-  }
-  auto& edge_info = maybe_edge_info.value();
 
   // check if the edge information is valid in fragment
   bool is_valid_edge = true;
@@ -193,21 +185,21 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteEdge(
         src_vertex_chunk_begin_indices[fid] +
         static_cast<GraphArchive::IdType>(
             std::ceil(vm_ptr->GetInnerVertexSize(fid, src_label_id) /
-                      static_cast<double>(edge_info.GetSrcChunkSize())));
+                      static_cast<double>(edge_info->GetSrcChunkSize())));
     dst_vertex_chunk_begin_indices[fid + 1] =
         dst_vertex_chunk_begin_indices[fid] +
         static_cast<GraphArchive::IdType>(
             std::ceil(vm_ptr->GetInnerVertexSize(fid, dst_label_id) /
-                      static_cast<double>(edge_info.GetDstChunkSize())));
+                      static_cast<double>(edge_info->GetDstChunkSize())));
   }
-  if (edge_info.ContainAdjList(GraphArchive::AdjListType::ordered_by_source)) {
+  if (edge_info->HasAdjacentListType(GraphArchive::AdjListType::ordered_by_source)) {
     auto inner_vertices = frag_->InnerVertices(src_label_id);
     writeEdgeImpl(edge_info, src_label_id, edge_label_id, dst_label_id,
                   src_vertex_chunk_begin_indices,
                   dst_vertex_chunk_begin_indices, inner_vertices,
                   GraphArchive::AdjListType::ordered_by_source);
   }
-  if (edge_info.ContainAdjList(
+  if (edge_info->HasAdjacentListType(
           GraphArchive::AdjListType::unordered_by_source)) {
     auto inner_vertices = frag_->InnerVertices(src_label_id);
     writeEdgeImpl(edge_info, src_label_id, edge_label_id, dst_label_id,
@@ -215,14 +207,14 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteEdge(
                   dst_vertex_chunk_begin_indices, inner_vertices,
                   GraphArchive::AdjListType::unordered_by_source);
   }
-  if (edge_info.ContainAdjList(GraphArchive::AdjListType::ordered_by_dest)) {
+  if (edge_info->HasAdjacentListType(GraphArchive::AdjListType::ordered_by_dest)) {
     auto inner_vertices = frag_->InnerVertices(dst_label_id);
     writeEdgeImpl(edge_info, dst_label_id, edge_label_id, src_label_id,
                   dst_vertex_chunk_begin_indices,
                   src_vertex_chunk_begin_indices, inner_vertices,
                   GraphArchive::AdjListType::ordered_by_dest);
   }
-  if (edge_info.ContainAdjList(GraphArchive::AdjListType::unordered_by_dest)) {
+  if (edge_info->HasAdjacentListType(GraphArchive::AdjListType::unordered_by_dest)) {
     auto inner_vertices = frag_->InnerVertices(dst_label_id);
     writeEdgeImpl(edge_info, dst_label_id, edge_label_id, src_label_id,
                   dst_vertex_chunk_begin_indices,
@@ -235,7 +227,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteEdge(
 
 template <typename FRAG_T>
 boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
-    const GraphArchive::EdgeInfo& edge_info, label_id_t main_label_id,
+    const std::shared_ptr<GraphArchive::EdgeInfo>& edge_info, label_id_t main_label_id,
     label_id_t edge_label_id, label_id_t another_label_id,
     const std::vector<GraphArchive::IdType>& main_start_chunk_indices,
     const std::vector<GraphArchive::IdType>& another_start_chunk_indices,
@@ -246,15 +238,15 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
   std::vector<std::shared_ptr<arrow::Field>> fields;
   if (adj_list_type == GraphArchive::AdjListType::ordered_by_source ||
       adj_list_type == GraphArchive::AdjListType::unordered_by_source) {
-    main_vertex_chunk_size = edge_info.GetSrcChunkSize();
-    another_vertex_chunk_size = edge_info.GetDstChunkSize();
+    main_vertex_chunk_size = edge_info->GetSrcChunkSize();
+    another_vertex_chunk_size = edge_info->GetDstChunkSize();
     fields = {
         arrow::field(GraphArchive::GeneralParams::kSrcIndexCol, arrow::int64()),
         arrow::field(GraphArchive::GeneralParams::kDstIndexCol,
                      arrow::int64())};
   } else {
-    main_vertex_chunk_size = edge_info.GetDstChunkSize();
-    another_vertex_chunk_size = edge_info.GetSrcChunkSize();
+    main_vertex_chunk_size = edge_info->GetDstChunkSize();
+    another_vertex_chunk_size = edge_info->GetSrcChunkSize();
     fields = {
         arrow::field(GraphArchive::GeneralParams::kDstIndexCol, arrow::int64()),
         arrow::field(GraphArchive::GeneralParams::kSrcIndexCol,
@@ -263,16 +255,17 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
   auto main_start_chunk_index = main_start_chunk_indices[frag_->fid()];
   auto another_start_chunk_index = another_start_chunk_indices[frag_->fid()];
 
-  GraphArchive::EdgeChunkWriter writer(edge_info, graph_info_->GetPrefix(),
-                                       adj_list_type);
+  auto maybe_writer = GraphArchive::EdgeChunkWriter::Make(edge_info, graph_info_->GetPrefix(),
+                                                    adj_list_type);
+  auto writer = maybe_writer.value();
   size_t vertex_chunk_num =
       std::ceil(vertices.size() / static_cast<double>(main_vertex_chunk_size));
 
   // collect properties
   auto& graph_schema = frag_->schema();
   std::set<label_id_t> properties;
-  for (auto& pg : edge_info.GetPropertyGroups(adj_list_type).value()) {
-    for (auto& property : pg.GetProperties()) {
+  for (const auto& pg : edge_info->GetPropertyGroups()) {
+    for (const auto& property : pg->GetProperties()) {
       label_id_t property_label_id =
           graph_schema.GetEdgePropertyId(edge_label_id, property.name);
       if (property_label_id == -1) {
@@ -357,7 +350,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     // write the adj list chunks
     FinishArrowArrayBuilders(builders, column_arrays);
     auto table = arrow::Table::Make(table_schema, column_arrays);
-    auto s = writer.WriteTable(table, vertex_chunk_index);
+    auto s = writer->WriteTable(table, vertex_chunk_index);
     if (!s.ok()) {
       return Status::IOError(
           "GAR error: " + std::to_string(static_cast<int>(s.code())) + ", " +
@@ -381,7 +374,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
           arrow::schema({arrow::field(GraphArchive::GeneralParams::kOffsetCol,
                                       arrow::int64())}),
           offset_columns);
-      auto st = writer.WriteOffsetChunk(offset_table, vertex_chunk_index);
+      auto st = writer->WriteOffsetChunk(offset_table, vertex_chunk_index);
       if (!st.ok()) {
         return Status::IOError(
             "GAR error: " + std::to_string(static_cast<int>(st.code())) + ", " +
@@ -390,7 +383,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     }
 
     // write edge num of vertex chunk
-    auto st = writer.WriteEdgesNum(vertex_chunk_index, edge_offset);
+    auto st = writer->WriteEdgesNum(vertex_chunk_index, edge_offset);
     if (!st.ok()) {
       return Status::IOError(
           "GAR error: " + std::to_string(static_cast<int>(st.code())) + ", " +
@@ -398,7 +391,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     }
     if (frag_->fid() == frag_->fnum() - 1) {
       // write vertex number
-      auto st = writer.WriteVerticesNum(label_id_to_vnum_.at(main_label_id));
+      auto st = writer->WriteVerticesNum(label_id_to_vnum_.at(main_label_id));
       if (!st.ok()) {
         return Status::IOError(
             "GAR error: " + std::to_string(static_cast<int>(st.code())) + ", " +
