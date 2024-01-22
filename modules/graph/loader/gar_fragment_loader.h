@@ -177,6 +177,10 @@ class GARFragmentLoader {
 
   bool generate_eid_;
   IdParser<vid_t> vid_parser_;
+
+  bool has_metadata_;
+  std::vector<int64_t> vertex_chunk_begins_;
+  std::vector<int64_t> vertex_chunk_nums_;
 };
 
 namespace detail {

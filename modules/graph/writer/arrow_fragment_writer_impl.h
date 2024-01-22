@@ -18,6 +18,7 @@
 
 #ifdef ENABLE_GAR
 
+#include <fstream>
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -116,8 +117,19 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
   if (!st.ok()) {
     RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
   }
+  if (true) {
+    int64_t vertex_chunk_num =
+        std::ceil(vertex_table->num_rows() /
+                  static_cast<double>(vertex_info->GetChunkSize()));
+    std::string path = graph_info_->GetPrefix() + vertex_info->GetPrefix() + "metadata_" +
+                       std::to_string(frag_->fid());
+    std::ofstream fout(path, std::ios::binary);
+    fout.write(reinterpret_cast<char*>(&chunk_index_begin), sizeof(chunk_index_begin));
+    fout.write(reinterpret_cast<char*>(&vertex_chunk_num), sizeof(vertex_chunk_num));
+    fout.close();
+  } 
 
-  if (frag_->fid() == frag_->fnum() - 1) {
+  if (has_metadata_ || frag_->fid() == frag_->fnum() - 1) {
     // write vertex number
     auto total_vertices_num = chunk_index_begin * vertex_info->GetChunkSize() +
                               vertex_table->num_rows();

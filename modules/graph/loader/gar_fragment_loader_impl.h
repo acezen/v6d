@@ -18,6 +18,7 @@ limitations under the License.
 
 #ifdef ENABLE_GAR
 
+#include <fstream>
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -193,33 +194,45 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 boost::leaf::result<void>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::distributeVertices() {
-  
-  for (const auto& vertex_info  : graph_info_->GetVertexInfos()) {
+  vertex_chunk_begins_.resize(graph_info_->VertexInfoNum(), 0);
+  vertex_chunk_nums_.resize(graph_info_->VertexInfoNum(), 0);
+  for (int i = 0; i < graph_info_->VertexInfoNum(); ++i) {
+    const auto& vertex_info = graph_info_->GetVertexInfoByIndex(i);
     const auto& label = vertex_info->GetLabel();
     vertex_labels_.push_back(label);
     vertex_chunk_sizes_.push_back(vertex_info->GetChunkSize());
-    auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
-        graph_info_->GetPrefix(), vertex_info);
-    RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
-    // distribute the vertex chunks for fragments
-    auto chunk_num = chunk_num_result.value();
-
-    vertex_chunk_begin_of_frag_[label].resize(comm_spec_.fnum() + 1, 0);
-    if (chunk_num < static_cast<int64_t>(comm_spec_.fnum())) {
-      int64_t index = 0;
-      for (; index < chunk_num; ++index) {
-        vertex_chunk_begin_of_frag_[label][index] = index;
-      }
-      for (; index <= static_cast<int64_t>(comm_spec_.fnum()); ++index) {
-        vertex_chunk_begin_of_frag_[label][index] = chunk_num;
-      }
+    if (true) {
+      std::string path = graph_info_->GetPrefix() + vertex_info->GetPrefix() + "metadata_" + std::to_string(comm_spec_.fid());
+      std::ifstream fin(path, std::ios::binary);
+      fin.read(reinterpret_cast<char*>(&vertex_chunk_begins_[i]),
+               sizeof(int64_t));
+      fin.read(reinterpret_cast<char*>(&vertex_chunk_nums_[i]),
+               sizeof(int64_t));
+      fin.close();
     } else {
-      int64_t bsize = chunk_num / static_cast<int64_t>(comm_spec_.fnum());
-      for (fid_t fid = 0; fid < comm_spec_.fnum(); ++fid) {
-        vertex_chunk_begin_of_frag_[label][fid] =
-            static_cast<gar_id_t>(fid) * bsize;
+      auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
+          graph_info_->GetPrefix(), vertex_info);
+      RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
+      // distribute the vertex chunks for fragments
+      auto chunk_num = chunk_num_result.value();
+
+      if (chunk_num <= static_cast<int64_t>(comm_spec_.fnum())) {
+        if (chunk_num < comm_spec_.fid() + 1) {
+          vertex_chunk_begins_[i] = 0;
+          vertex_chunk_nums_[i] = 0;
+        } else  {
+          vertex_chunk_begins_[i] = static_cast<int64_t>(comm_spec_.fid());
+          vertex_chunk_nums_[i] = 1;
+        }
+      } else {
+        int64_t bsize = chunk_num / static_cast<int64_t>(comm_spec_.fnum());
+        vertex_chunk_begins_[i] = static_cast<int64_t>(comm_spec_.fid()) * bsize;
+        if (comm_spec_.fid() == comm_spec_.fnum() - 1) {
+          vertex_chunk_nums_[i] = chunk_num - vertex_chunk_begins_[i];
+        } else {
+          vertex_chunk_nums_[i] = bsize;
+        }
       }
-      vertex_chunk_begin_of_frag_[label][comm_spec_.fnum()] = chunk_num;
     }
   }
   vertex_label_num_ = vertex_labels_.size();
@@ -258,29 +271,10 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::constructVertexMap() {
     std::vector<std::shared_ptr<arrow::ChunkedArray>> shuffled_oid_array;
     const auto& vertex_info =
         graph_info_->GetVertexInfo(vertex_labels_[label_id]);
-    const auto& property_groups = vertex_info->GetPropertyGroups();
-    std::string primary_key;
-    for (const auto& pg : property_groups) {
-      for (const auto& prop : pg->GetProperties()) {
-        if (prop.is_primary) {
-          primary_key = prop.name;
-          break;
-        }
-      }
-      if (!primary_key.empty()) {
-        break;
-      }
-    }
-    if (primary_key.empty()) {
-      std::string msg = "primary key is not found in " +
-                        vertex_labels_[label_id] + " property groups";
-      RETURN_GS_ERROR(ErrorCode::kInvalidValueError, msg);
-    }
     auto local_oid_array =
-        vertex_tables_[label_id]->GetColumnByName(primary_key);
+        vertex_tables_[label_id]->GetColumnByName(GraphArchive::GeneralParams::kVertexIndexCol);
     if (local_oid_array == nullptr) {
-      std::string msg = "primary key column " + primary_key +
-                        " is not found in " + vertex_labels_[label_id] +
+      std::string msg = "vertex index column is not found in " + vertex_labels_[label_id] +
                         " table";
       RETURN_GS_ERROR(ErrorCode::kInvalidValueError, msg);
     }
@@ -311,11 +305,8 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
     const std::string& vertex_label) {
   auto vertex_info = graph_info_->GetVertexInfo(vertex_label);
   label_id_t label_id = vertex_label_to_index_[vertex_label];
-  auto vertex_chunk_begin =
-      vertex_chunk_begin_of_frag_[vertex_label][comm_spec_.fid()];
-  auto vertex_chunk_num_of_fragment =
-      vertex_chunk_begin_of_frag_[vertex_label][comm_spec_.fid() + 1] -
-      vertex_chunk_begin_of_frag_[vertex_label][comm_spec_.fid()];
+  auto vertex_chunk_begin = vertex_chunk_begins_[label_id];
+  auto vertex_chunk_num_of_fragment = vertex_chunk_nums_[label_id];
   auto chunk_size = vertex_info->GetChunkSize();
   const auto& property_groups = vertex_info->GetPropertyGroups();
 
@@ -410,18 +401,12 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   int64_t edge_chunk_size = edge_info->GetChunkSize();
   int64_t vertex_chunk_size;
   if (adj_list_type == GraphArchive::AdjListType::ordered_by_source) {
-    vertex_chunk_begin =
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid()];
-    vertex_chunk_num_of_fragment =
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid() + 1] -
-        vertex_chunk_begin_of_frag_[src_label][comm_spec_.fid()];
+    vertex_chunk_begin = vertex_chunk_begins_[vertex_label_to_index_[src_label]];
+    vertex_chunk_num_of_fragment = vertex_chunk_nums_[vertex_label_to_index_[src_label]];
     vertex_chunk_size = edge_info->GetSrcChunkSize();
   } else {
-    vertex_chunk_begin =
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid()];
-    vertex_chunk_num_of_fragment =
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid() + 1] -
-        vertex_chunk_begin_of_frag_[dst_label][comm_spec_.fid()];
+    vertex_chunk_begin = vertex_chunk_begins_[vertex_label_to_index_[dst_label]];
+    vertex_chunk_num_of_fragment = vertex_chunk_nums_[vertex_label_to_index_[dst_label]];
     vertex_chunk_size = edge_info->GetDstChunkSize();
   }
   std::vector<std::shared_ptr<arrow::Int64Array>> offset_arrays(
@@ -550,6 +535,7 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   auto adj_list_table = arrow::ConcatenateTables(edge_chunk_tables);
   RETURN_GS_ERROR_IF_NOT_OK(adj_list_table.status());
   std::shared_ptr<arrow::Table> adj_list_table_with_gid;
+  // internal id to global id
   BOOST_LEAF_ASSIGN(
       adj_list_table_with_gid,
       parseEdgeIdArrays(std::move(adj_list_table).ValueOrDie(),
@@ -734,24 +720,23 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::parseIdChunkedArrayChunk(
   }
 
   vid_t* builder = reinterpret_cast<vid_t*>(buffer->mutable_data());
-  const auto& label_name = vertex_labels_[label_id];
   const gar_id_t* ids =
       reinterpret_cast<const gar_id_t*>(id_array->raw_values());
   if (all_be_local_vertex) {
-    gar_id_t start_id =
-        vertex_chunk_begin_of_frag_[label_name][comm_spec_.fid()] *
-        vertex_chunk_sizes_[label_id];
+    gar_id_t start_id = vertex_chunk_begins_[label_id] * vertex_chunk_sizes_[label_id];
     for (int64_t k = 0; k != id_array->length(); ++k) {
       builder[k] =
           vid_parser_.GenerateId(comm_spec_.fid(), label_id, ids[k] - start_id);
     }
   } else {
+    vid_t gid = 0;
     for (int64_t k = 0; k != id_array->length(); ++k) {
-      fid_t fid = getPartitionId(ids[k], label_id);
-      builder[k] = vid_parser_.GenerateId(
-          fid, label_id,
-          ids[k] - vertex_chunk_begin_of_frag_[label_name][fid] *
-                       vertex_chunk_sizes_[label_id]);
+      if (vm_ptr_->GetGid(label_id, ids[k], gid)) {
+        builder[k] = gid;
+      } else {
+        LOG(WARNING) << "vertex " << ids[k] << " is not found in fragment "
+                     << comm_spec_.fid();
+      }
     }
   }
   out = std::make_shared<ArrowArrayType<VID_T>>(

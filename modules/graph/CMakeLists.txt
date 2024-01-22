@@ -200,6 +200,7 @@ if(BUILD_VINEYARD_TESTS)
         endif()
         target_link_libraries(${T_NAME} PRIVATE
                               vineyard_graph
+                              vineyard_io
                               ${ARROW_SHARED_LIB}
                               ${MPI_CXX_LIBRARIES})
         if(${LIBUNWIND_FOUND})

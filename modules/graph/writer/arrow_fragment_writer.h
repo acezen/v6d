@@ -122,6 +122,8 @@ class ArrowFragmentWriter {
   grape::CommSpec comm_spec_;
   std::shared_ptr<GraphArchive::GraphInfo> graph_info_;
   std::map<label_id_t, int64_t> label_id_to_vnum_;
+
+  bool has_metadata_;
 };
 
 }  // namespace vineyard
