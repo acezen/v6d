@@ -510,17 +510,14 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   batch_size = (total_edge_chunk_num + thread_num - 1) / thread_num;
   for (int64_t i = 0; i < thread_num; ++i) {
     threads[i] = std::thread([&]() -> boost::leaf::result<void> {
-      auto expect = GraphArchive::AdjListArrowChunkReader::Make(
-          edge_info, adj_list_type, graph_info_->GetPrefix());
-      RETURN_GS_ERROR_IF_NOT_OK(expect.status());
-      auto reader = expect.value();
+      auto reader = std::make_shared<GraphArchive::AdjListArrowChunkReader>(
+          edge_info, adj_list_type, graph_info_->GetPrefix(), vertex_chunk_begin);
       std::vector<std::shared_ptr<GraphArchive::AdjListPropertyArrowChunkReader>>
           property_readers;
       for (const auto& pg : property_groups) {
-        auto maybe_pg_reader = GraphArchive::AdjListPropertyArrowChunkReader::Make(
-            edge_info, pg, adj_list_type, graph_info_->GetPrefix());
-        RETURN_GS_ERROR_IF_NOT_OK(maybe_pg_reader.status());
-        property_readers.emplace_back(maybe_pg_reader.value());
+        auto pg_reader = std::make_shared<GraphArchive::AdjListPropertyArrowChunkReader>(
+            edge_info, pg, adj_list_type, graph_info_->GetPrefix(), vertex_chunk_begin);
+        property_readers.emplace_back(pg_reader);
       }
       while (true) {
         int64_t begin = cur.fetch_add(batch_size);
