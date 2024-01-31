@@ -87,7 +87,10 @@ class GARFragmentLoader {
    * @param directed
    */
   GARFragmentLoader(Client& client, const grape::CommSpec& comm_spec,
-                    const std::string& graph_info_yaml, bool directed = true,
+                    const std::string& graph_info_yaml, 
+                    const std::vector<std::string>& vertex_labels, 
+                    const std::vector<std::vector<std::string>>& edge_labels,
+                    bool directed = true,
                     bool generate_eid = false, bool store_in_local = false);
 
   ~GARFragmentLoader() = default;

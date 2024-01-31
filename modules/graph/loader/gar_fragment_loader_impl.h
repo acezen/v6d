@@ -51,7 +51,10 @@ template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::GARFragmentLoader(
     Client& client, const grape::CommSpec& comm_spec,
-    const std::string& graph_info_yaml, bool directed, bool generate_eid,
+    const std::string& graph_info_yaml,
+    const std::vector<std::string>& vertex_labels,
+    const std::vector<std::vector<std::string>>& edge_labels,
+    bool directed, bool generate_eid,
     bool store_in_local)
     : client_(client),
       comm_spec_(comm_spec),
@@ -65,6 +68,23 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::GARFragmentLoader(
                << ", error: " << maybe_graph_info.status().message();
   }
   graph_info_ = maybe_graph_info.value();
+  if (!vertex_labels.empty() && !edge_labels.empty()) {
+    GraphArchive::VertexInfoVector project_vertex_infos;
+    GraphArchive::EdgeInfoVector project_edge_infos;
+    for (const auto& label : vertex_labels) {
+      auto vertex_info = graph_info_->GetVertexInfo(label);
+      if (vertex_info != nullptr) {
+        project_vertex_infos.push_back(vertex_info);
+      }
+    }
+    for (const auto& triple : edge_labels) {
+      auto edge_info = graph_info_->GetEdgeInfo(triple[0], triple[1], triple[2]);
+      if (edge_info != nullptr) {
+        project_edge_infos.push_back(edge_info);
+      }
+    }
+    graph_info_ = GraphArchive::CreateGraphInfo(graph_info_->GetName(), project_vertex_infos, project_edge_infos, graph_info_->GetPrefix(), graph_info_->version());
+  }
 }
 
 template <typename OID_T, typename VID_T,
