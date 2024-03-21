@@ -38,15 +38,6 @@ limitations under the License.
 
 namespace vineyard {
 
-#ifndef RETURN_GS_ERROR_IF_NOT_OK
-#define RETURN_GS_ERROR_IF_NOT_OK(status)                          \
-  do {                                                             \
-    if (!status.ok()) {                                            \
-      RETURN_GS_ERROR(ErrorCode::kGraphArError, status.message()); \
-    }                                                              \
-  } while (false);
-#endif
-
 template <typename OID_T, typename VID_T,
           template <typename, typename> class VERTEX_MAP_T>
 GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::GARFragmentLoader(
@@ -68,13 +59,7 @@ boost::leaf::result<void> GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::Init(
   store_in_local_ = store_in_local;
 
   // Load graph info.
-  auto maybe_graph_info = GraphArchive::GraphInfo::Load(graph_info_yaml);
-  if (!maybe_graph_info.status().ok()) {
-    RETURN_GS_ERROR(ErrorCode::kGraphArError,
-                    "Failed to load graph info from " + graph_info_yaml +
-                        ", error: " + maybe_graph_info.status().message());
-  }
-  graph_info_ = maybe_graph_info.value();
+  GAR_OK_ASSIGN_OR_RAISE(graph_info_, GraphArchive::GraphInfo::Load(graph_info_yaml));
   if (!selected_vertices.empty() && !selected_edges.empty()) {
     // project a subgraph from the original graph.
     GraphArchive::VertexInfoVector project_vertex_infos;
@@ -321,26 +306,19 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::initializeVertexChunkBeginAndNum(
     }
     auto input_stream = input_stream_result.ValueOrDie();
     // read the vertex chunk begin of vertex label i
-    auto read_result = input_stream->Read(
-        sizeof(int64_t), &vertex_chunk_begins_[vertex_label_index]);
-    if (!read_result.ok()) {
-      RETURN_GS_ERROR(ErrorCode::kArrowError, read_result.status().message());
-    }
-    assert(read_result.ValueOrDie() == sizeof(int64_t));
+    int64_t read_size = 0;
+    ARROW_OK_ASSIGN_OR_RAISE(read_size, input_stream->Read(
+        sizeof(int64_t), &vertex_chunk_begins_[vertex_label_index]));
+    assert(read_size == sizeof(int64_t));
     // read the vertex chunk num of vertex label i
-    read_result = input_stream->Read(sizeof(int64_t),
-                                     &vertex_chunk_nums_[vertex_label_index]);
-    if (!read_result.ok()) {
-      RETURN_GS_ERROR(ErrorCode::kArrowError, read_result.status().message());
-    }
-    assert(read_result.ValueOrDie() == sizeof(int64_t));
+    ARROW_OK_ASSIGN_OR_RAISE(read_size, input_stream->Read(sizeof(int64_t),
+                                     &vertex_chunk_nums_[vertex_label_index]));
+    assert(read_size == sizeof(int64_t));
   } else {
     // distribute the vertex chunks for fragments
-    auto chunk_num_result = GraphArchive::util::GetVertexChunkNum(
-        graph_info_->GetPrefix(), vertex_info);
-    RETURN_GS_ERROR_IF_NOT_OK(chunk_num_result.status());
-    auto chunk_num = chunk_num_result.value();
-
+    int64_t chunk_num = 0;
+    GAR_OK_ASSIGN_OR_RAISE(chunk_num, GraphArchive::util::GetVertexChunkNum(
+        graph_info_->GetPrefix(), vertex_info));
     if (chunk_num <= static_cast<int64_t>(comm_spec_.fnum())) {
       if (chunk_num < comm_spec_.fid() + 1) {
         // no vertex chunk can be assigned to this fragment
@@ -435,10 +413,9 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
     std::atomic<int64_t> cur_chunk_index(0);
     for (int64_t i = 0; i < thread_num; ++i) {
       threads[i] = std::thread([&]() -> boost::leaf::result<void> {
-        auto maybe_reader = GraphArchive::VertexPropertyArrowChunkReader::Make(
-            vertex_info, pg, graph_info_->GetPrefix());
-        RETURN_GS_ERROR_IF_NOT_OK(maybe_reader.status());
-        auto& reader = maybe_reader.value();
+        std::shared_ptr<GraphArchive::VertexPropertyArrowChunkReader> reader;
+        GAR_OK_ASSIGN_OR_RAISE(reader, GraphArchive::VertexPropertyArrowChunkReader::Make(
+            vertex_info, pg, graph_info_->GetPrefix()));
         while (true) {
           int64_t begin = cur_chunk_index.fetch_add(batch_size);
           if (begin >= vertex_chunk_num_of_fragment) {
@@ -448,11 +425,9 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
                                  vertex_chunk_num_of_fragment);
           int64_t iter = begin;
           while (iter != end) {
-            RETURN_GS_ERROR_IF_NOT_OK(
+            GAR_OK_OR_RAISE(
                 reader->seek((vertex_chunk_begin + iter) * chunk_size));
-            auto chunk_table = reader->GetChunk();
-            RETURN_GS_ERROR_IF_NOT_OK(chunk_table.status());
-            vertex_chunk_tables[iter] = chunk_table.value();
+            GAR_OK_ASSIGN_OR_RAISE(vertex_chunk_tables[iter], reader->GetChunk());
             ++iter;
           }
         }
@@ -464,25 +439,17 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadVertexTableOfLabel(
     }
     std::shared_ptr<arrow::Table> pg_table;
     if (vertex_chunk_num_of_fragment > 0) {
-      auto pg_table_ret = arrow::ConcatenateTables(vertex_chunk_tables);
-      if (!pg_table_ret.status().ok()) {
-        RETURN_GS_ERROR(ErrorCode::kArrowError,
-                        pg_table_ret.status().message());
-      }
-      pg_table = pg_table_ret.ValueOrDie();
+      ARROW_OK_ASSIGN_OR_RAISE(pg_table, arrow::ConcatenateTables(vertex_chunk_tables));
     } else {
       auto schema = ConstructSchemaFromPropertyGroup(pg);
-      auto pg_table_ret = arrow::Table::MakeEmpty(schema);
-      if (!pg_table_ret.status().ok()) {
-        RETURN_GS_ERROR(ErrorCode::kArrowError,
-                        pg_table_ret.status().message());
-      }
-      pg_table = pg_table_ret.ValueOrDie();
+      ARROW_OK_ASSIGN_OR_RAISE(pg_table, arrow::Table::MakeEmpty(schema));
     }
     pg_tables.push_back(std::move(pg_table));
   }
   std::shared_ptr<arrow::Table> concat_table;
   VY_OK_OR_RAISE(ConcatenateTablesColumnWise(pg_tables, concat_table));
+  LOG(INFO) << "Vertex table of label " << vertex_label
+            << " has been loaded, the table schema is " << concat_table->schema()->ToString();
   // loosen the data type
   std::shared_ptr<arrow::Schema> normalized_schema;
   VY_OK_OR_RAISE(TypeLoosen({concat_table->schema()}, normalized_schema));
@@ -540,11 +507,10 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   // read the offset arrays
   for (int64_t i = 0; i < thread_num; ++i) {
     threads[i] = std::thread([&]() -> boost::leaf::result<void> {
-      auto maybe_offset_reader =
+      std::shared_ptr<GraphArchive::AdjListOffsetArrowChunkReader> offset_reader;
+      GAR_OK_ASSIGN_OR_RAISE(offset_reader, 
           GraphArchive::AdjListOffsetArrowChunkReader::Make(
-              edge_info, adj_list_type, graph_info_->GetPrefix());
-      RETURN_GS_ERROR_IF_NOT_OK(maybe_offset_reader.status());
-      auto offset_reader = maybe_offset_reader.value();
+              edge_info, adj_list_type, graph_info_->GetPrefix()));
       while (true) {
         int64_t begin = cur_chunk.fetch_add(batch_size);
         if (begin >= vertex_chunk_num_of_fragment) {
@@ -555,12 +521,12 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
         int64_t iter = begin;
         while (iter != end) {
           int64_t vertex_chunk_id = iter + vertex_chunk_begin;
-          RETURN_GS_ERROR_IF_NOT_OK(
+          GAR_OK_OR_RAISE(
               offset_reader->seek(vertex_chunk_id * vertex_chunk_size));
-          auto offset_result = offset_reader->GetChunk();
-          RETURN_GS_ERROR_IF_NOT_OK(offset_result.status());
+          std::shared_ptr<arrow::Array> offset_array;
+          GAR_OK_ASSIGN_OR_RAISE(offset_array, offset_reader->GetChunk());
           offset_arrays[iter] = std::dynamic_pointer_cast<arrow::Int64Array>(
-              offset_result.value());
+              offset_array);
 
           // get edge num of this vertex chunk from offset array
           int64_t edge_num =
@@ -600,19 +566,18 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   batch_size = (total_edge_chunk_num + thread_num - 1) / thread_num;
   for (int64_t i = 0; i < thread_num; ++i) {
     threads[i] = std::thread([&]() -> boost::leaf::result<void> {
-      auto maybe_reader = GraphArchive::AdjListArrowChunkReader::Make(
-          edge_info, adj_list_type, graph_info_->GetPrefix());
-      RETURN_GS_ERROR_IF_NOT_OK(maybe_reader.status());
-      auto reader = maybe_reader.value();
+      std::shared_ptr<GraphArchive::AdjListArrowChunkReader> reader;
+      GAR_OK_ASSIGN_OR_RAISE(reader, GraphArchive::AdjListArrowChunkReader::Make(
+          edge_info, adj_list_type, graph_info_->GetPrefix()));
       std::vector<
           std::shared_ptr<GraphArchive::AdjListPropertyArrowChunkReader>>
           property_readers;
       for (const auto& pg : property_groups) {
-        auto maybe_pg_reader =
+        std::shared_ptr<GraphArchive::AdjListPropertyArrowChunkReader> pg_reader;
+        GAR_OK_ASSIGN_OR_RAISE(pg_reader,
             GraphArchive::AdjListPropertyArrowChunkReader::Make(
-                edge_info, pg, adj_list_type, graph_info_->GetPrefix());
-        RETURN_GS_ERROR_IF_NOT_OK(maybe_pg_reader.status());
-        property_readers.emplace_back(maybe_pg_reader.value());
+                edge_info, pg, adj_list_type, graph_info_->GetPrefix()));
+        property_readers.emplace_back(pg_reader);
       }
       while (true) {
         int64_t begin = cur.fetch_add(batch_size);
@@ -628,18 +593,14 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
           auto chunk_pair = BinarySearchChunkPair(agg_edge_chunk_num, iter);
           auto vertex_chunk_id = chunk_pair.first + vertex_chunk_begin;
           auto edge_chunk_index = chunk_pair.second;
-          RETURN_GS_ERROR_IF_NOT_OK(
+          GAR_OK_OR_RAISE(
               reader->seek_chunk_index(vertex_chunk_id, edge_chunk_index));
-          auto edge_chunk_result = reader->GetChunk();
-          RETURN_GS_ERROR_IF_NOT_OK(edge_chunk_result.status());
-          edge_chunk_tables[iter] = edge_chunk_result.value();
+          GAR_OK_ASSIGN_OR_RAISE(edge_chunk_tables[iter], reader->GetChunk());
           for (size_t j = 0; j < property_groups.size(); ++j) {
             auto& pg_reader = property_readers[j];
-            RETURN_GS_ERROR_IF_NOT_OK(
+            GAR_OK_OR_RAISE(
                 pg_reader->seek_chunk_index(vertex_chunk_id, edge_chunk_index));
-            auto pg_result = pg_reader->GetChunk();
-            RETURN_GS_ERROR_IF_NOT_OK(pg_result.status());
-            edge_property_chunk_tables[j][iter] = pg_result.value();
+            GAR_OK_ASSIGN_OR_RAISE(edge_property_chunk_tables[j][iter], pg_reader->GetChunk());
           }
           ++iter;
         }
@@ -651,13 +612,13 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
     t.join();
   }
   // process adj list tables
-  auto adj_list_table = arrow::ConcatenateTables(edge_chunk_tables);
-  RETURN_GS_ERROR_IF_NOT_OK(adj_list_table.status());
+  std::shared_ptr<arrow::Table> adj_list_table;
+  ARROW_OK_ASSIGN_OR_RAISE(adj_list_table, arrow::ConcatenateTables(edge_chunk_tables));
   std::shared_ptr<arrow::Table> adj_list_table_with_gid;
   // internal id to global id
   BOOST_LEAF_ASSIGN(
       adj_list_table_with_gid,
-      parseEdgeIdArrays(std::move(adj_list_table).ValueOrDie(),
+      parseEdgeIdArrays(std::move(adj_list_table),
                         vertex_label_to_index_[src_label],
                         vertex_label_to_index_[dst_label], adj_list_type));
 
@@ -666,10 +627,8 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   std::vector<std::shared_ptr<arrow::Table>> property_table_of_groups(
       property_groups.size());
   for (size_t i = 0; i < property_groups.size(); ++i) {
-    auto property_chunk_table =
-        arrow::ConcatenateTables(edge_property_chunk_tables[i]);
-    RETURN_GS_ERROR_IF_NOT_OK(property_chunk_table.status());
-    property_table_of_groups[i] = std::move(property_chunk_table).ValueOrDie();
+    ARROW_OK_ASSIGN_OR_RAISE(property_table_of_groups[i],
+        arrow::ConcatenateTables(edge_property_chunk_tables[i]));
   }
 
   label_id_t label_id = edge_label_to_index_[edge_label];
@@ -681,6 +640,9 @@ GARFragmentLoader<OID_T, VID_T, VERTEX_MAP_T>::loadEdgeTableOfLabel(
   if (!property_groups.empty()) {
     VY_OK_OR_RAISE(ConcatenateTablesColumnWise(property_table_of_groups,
                                                concat_property_table));
+    LOG(INFO) << "Edge property table of label " << edge_label
+              << " has been loaded, the table schema is "
+              << concat_property_table->schema()->ToString();
     // loosen the data type
     std::shared_ptr<arrow::Schema> normalized_schema;
     VY_OK_OR_RAISE(

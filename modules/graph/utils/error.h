@@ -280,5 +280,28 @@ sync_gs_error(const grape::CommSpec& comm_spec, F_T&& f, ARGS_T&&... args) {
   } while (0)
 #endif  // ARROW_CHECK_OK_AND_ASSIGN
 
+#ifndef GAR_OK_OR_RAISE
+#define GAR_OK_OR_RAISE(expr) \
+  do {                        \
+    auto status_name = (expr); \
+    if (!(status_name).ok()) { \
+      RETURN_GS_ERROR(vineyard::ErrorCode::kGraphArError, \
+                      (status_name).message());           \
+    }                         \
+  } while (0)
+#endif  // GAR_OK_OR_RAISE
+
+#ifndef GAR_OK_ASSIGN_OR_RAISE
+#define GAR_OK_ASSIGN_OR_RAISE(lhs, expr)               \
+  do {                                                    \
+    auto status_name = (expr);                            \
+    if (!(status_name).status().ok()) {                            \
+      RETURN_GS_ERROR(vineyard::ErrorCode::kGraphArError,   \
+                      (status_name).status().message()); \
+    }                                                     \
+    (lhs) = std::move(status_name).value();          \
+  } while (0)
+#endif  // GAR_OK_ASSIGN_OR_RAISE
+
 }  // namespace vineyard
 #endif  // MODULES_GRAPH_UTILS_ERROR_H_

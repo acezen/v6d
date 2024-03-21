@@ -33,110 +33,20 @@ using GraphType = ArrowFragment<property_graph_types::OID_TYPE,
                                 property_graph_types::VID_TYPE>;
 using LabelType = typename GraphType::label_id_t;
 
-void WriteOut(vineyard::Client& client, const grape::CommSpec& comm_spec,
-              vineyard::ObjectID fragment_group_id) {
-  LOG(INFO) << "Loaded graph to vineyard: " << fragment_group_id;
-  std::shared_ptr<vineyard::ArrowFragmentGroup> fg =
-      std::dynamic_pointer_cast<vineyard::ArrowFragmentGroup>(
-          client.GetObject(fragment_group_id));
-
-  for (const auto& pair : fg->Fragments()) {
-    LOG(INFO) << "[frag-" << pair.first << "]: " << pair.second;
-  }
-
-  // NB: only retrieve local fragments.
-  auto locations = fg->FragmentLocations();
-  for (const auto& pair : fg->Fragments()) {
-    if (locations.at(pair.first) != client.instance_id()) {
-      continue;
-    }
-    auto frag_id = pair.second;
-    auto frag = std::dynamic_pointer_cast<GraphType>(client.GetObject(frag_id));
-    auto schema = frag->schema();
-    auto mg_schema = vineyard::MaxGraphSchema(schema);
-    mg_schema.DumpToFile("/tmp/" + std::to_string(fragment_group_id) + ".json");
-
-    LOG(INFO) << "graph total node number: " << frag->GetTotalNodesNum();
-    LOG(INFO) << "fragment edge number: " << frag->GetEdgeNum();
-    LOG(INFO) << "fragment in edge number: " << frag->GetInEdgeNum();
-    LOG(INFO) << "fragment out edge number: " << frag->GetOutEdgeNum();
-
-    LOG(INFO) << "[worker-" << comm_spec.worker_id()
-              << "] loaded graph to vineyard: " << ObjectIDToString(frag_id)
-              << " ...";
-
-    for (LabelType vlabel = 0; vlabel < frag->vertex_label_num(); ++vlabel) {
-      LOG(INFO) << "vertex table: " << vlabel << " -> "
-                << frag->vertex_data_table(vlabel)->schema()->ToString(true);
-    }
-    for (LabelType elabel = 0; elabel < frag->edge_label_num(); ++elabel) {
-      LOG(INFO) << "edge table: " << elabel << " -> "
-                << frag->edge_data_table(elabel)->schema()->ToString(true);
-    }
-
-    for (LabelType elabel = 0; elabel < frag->edge_label_num(); ++elabel) {
-      LOG(INFO) << "--------------- start dump edge label " << elabel
-                << "---------------";
-      for (LabelType vlabel = 0; vlabel < frag->vertex_label_num(); ++vlabel) {
-        auto ie = frag->InnerVertices(vlabel);
-        for (auto v : ie) {
-          auto oe = frag->GetOutgoingAdjList(v, elabel);
-          for (auto e : oe) {
-            LOG(INFO) << frag->GetId(v) << " -> " << frag->GetId(e.neighbor())
-                      << " " << static_cast<int64_t>(e.get_data<int64_t>(0))
-                      << " " << static_cast<int64_t>(e.get_data<int64_t>(1))
-                      << " " << static_cast<int64_t>(e.get_data<int64_t>(2))
-                      << " " << static_cast<int64_t>(e.get_data<int64_t>(3));
-          }
-          if (frag->directed()) {
-            auto ie = frag->GetIncomingAdjList(v, elabel);
-            for (auto& e : ie) {
-              LOG(INFO) << frag->GetId(e.neighbor()) << " -> " << frag->GetId(v)
-                        << " " << static_cast<int64_t>(e.get_data<int64_t>(0))
-                        << " " << static_cast<int64_t>(e.get_data<int64_t>(1))
-                        << " " << static_cast<int64_t>(e.get_data<int64_t>(2))
-                        << " " << static_cast<int64_t>(e.get_data<int64_t>(3));
-            }
-          }
-        }
-      }
-    }
-
-    LOG(INFO) << "--------------- consolidate vertex/edge table columns ...";
-
-    if (frag->vertex_data_table(0)->columns().size() >= 4) {
-      auto vcols = std::vector<std::string>{"value1", "value3"};
-      auto vfrag_id =
-          frag->ConsolidateVertexColumns(client, 0, vcols, "vmerged").value();
-      auto vfrag =
-          std::dynamic_pointer_cast<GraphType>(client.GetObject(vfrag_id));
-
-      for (LabelType vlabel = 0; vlabel < vfrag->vertex_label_num(); ++vlabel) {
-        LOG(INFO) << "vertex table: " << vlabel << " -> "
-                  << vfrag->vertex_data_table(vlabel)->schema()->ToString();
-      }
-    }
-
-    if (frag->edge_data_table(0)->columns().size() >= 4) {
-      auto ecols = std::vector<std::string>{"value2", "value4"};
-      auto efrag_id =
-          frag->ConsolidateEdgeColumns(client, 0, ecols, "emerged").value();
-      auto efrag =
-          std::dynamic_pointer_cast<GraphType>(client.GetObject(efrag_id));
-
-      for (LabelType elabel = 0; elabel < efrag->edge_label_num(); ++elabel) {
-        LOG(INFO) << "edge table: " << elabel << " -> "
-                  << efrag->edge_data_table(elabel)->schema()->ToString();
-      }
-    }
-  }
-}
-
 namespace detail {
 
 std::shared_ptr<arrow::ChunkedArray> makeInt64Array() {
   std::vector<int64_t> data = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
   arrow::Int64Builder builder;
+  CHECK_ARROW_ERROR(builder.AppendValues(data));
+  std::shared_ptr<arrow::Array> out;
+  CHECK_ARROW_ERROR(builder.Finish(&out));
+  return arrow::ChunkedArray::Make({out}).ValueOrDie();
+}
+
+std::shared_ptr<arrow::ChunkedArray> makeTimestampArray() {
+  std::vector<arrow::TimestampType::c_type> data = {1711355740, 1711355741, 1711355742, 1711355743, 1711355744, 1711355745, 1711355746, 1711355747, 1711355748, 1711355749};
+  arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::MILLI, "UTC"), arrow::default_memory_pool());
   CHECK_ARROW_ERROR(builder.AppendValues(data));
   std::shared_ptr<arrow::Array> out;
   CHECK_ARROW_ERROR(builder.Finish(&out));
@@ -181,13 +91,14 @@ std::vector<std::vector<std::shared_ptr<arrow::Table>>> makeETables() {
           arrow::field("value2", arrow::int64()),
           arrow::field("value3", arrow::int64()),
           arrow::field("value4", arrow::int64()),
+          arrow::field("value5", arrow::timestamp(arrow::TimeUnit::MILLI, "UTC")),
       });
   schema = attachMetadata(schema, "label", "knows");
   schema = attachMetadata(schema, "src_label", "person");
   schema = attachMetadata(schema, "dst_label", "person");
   auto table = arrow::Table::Make(
       schema, {makeInt64Array(), makeInt64Array(), makeInt64Array(),
-               makeInt64Array(), makeInt64Array(), makeInt64Array()});
+               makeInt64Array(), makeInt64Array(), makeInt64Array(), makeTimestampArray()});
   return {{table}};
 }
 }  // namespace detail
@@ -226,18 +137,22 @@ int main(int argc, char** argv) {
               client, comm_spec, vtables, etables, directed != 0);
       vineyard::ObjectID fragment_group_id =
           loader->LoadFragmentAsFragmentGroup().value();
-      WriteOut(client, comm_spec, fragment_group_id);
-    }
-
-    // Load from efiles
-    {
-      auto loader =
-          std::make_unique<ArrowFragmentLoader<property_graph_types::OID_TYPE,
-                                               property_graph_types::VID_TYPE>>(
-              client, comm_spec, etables, directed != 0);
-      vineyard::ObjectID fragment_group_id =
-          loader->LoadFragmentAsFragmentGroup().value();
-      WriteOut(client, comm_spec, fragment_group_id);
+      auto fg = std::dynamic_pointer_cast<ArrowFragmentGroup>(
+          client.GetObject(fragment_group_id));
+      auto fid = comm_spec.WorkerToFrag(comm_spec.worker_id());
+      auto frag_id = fg->Fragments().at(fid);
+      auto arrow_frag =
+          std::static_pointer_cast<GraphType>(client.GetObject(frag_id));
+      // WriteOut(client, comm_spec, fragment_group_id);
+      LOG(INFO) << "Loaded fragment, schema: " << arrow_frag->schema().ToJSONString();
+      auto vertices = arrow_frag->InnerVertices(0);
+      // get the timestamp value of each edge
+      for (auto v : vertices) {
+        for (auto& e : arrow_frag->GetOutgoingAdjList(v, 0)) {
+          LOG(INFO) << "  edge " << arrow_frag->GetId(v) << " " << arrow_frag->GetId(e.neighbor())
+                    << " timestamp " << e.get_data<arrow::TimestampType::c_type>(4);
+        }
+      }
     }
   }
   grape::FinalizeMPIComm();

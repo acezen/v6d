@@ -65,8 +65,8 @@ void InitializeArrayArrayBuilders(
     const property_graph_types::LABEL_ID_TYPE edge_label,
     const PropertyGraphSchema& graph_schema);
 
-std::shared_ptr<arrow::Table> AppendNullsToArrowTable(
-    const std::shared_ptr<arrow::Table>& table, size_t num_rows_to_append);
+boost::leaf::result<std::shared_ptr<arrow::Table>> AppendNullsToArrowTable(
+    const std::shared_ptr<arrow::Table>& table, int64_t num_rows_to_append);
 
 template <typename FRAG_T>
 class ArrowFragmentWriter {

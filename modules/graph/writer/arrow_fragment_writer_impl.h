@@ -51,7 +51,7 @@
 #include "io/io/i_io_adaptor.h"
 #include "io/io/io_factory.h"
 
-namespace GAR = GraphArchive;
+namespace GraphAr = GraphArchive;
 
 namespace vineyard {
 
@@ -65,13 +65,8 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::Init(
     const std::string& graph_info_yaml) {
   frag_ = std::move(frag);
   comm_spec_ = std::move(comm_spec);
-  // Load graph info.
-  auto maybe_graph_info = GAR::GraphInfo::Load(graph_info_yaml);
-  if (!maybe_graph_info.status().ok()) {
-    RETURN_GS_ERROR(ErrorCode::kGraphArError,
-                    maybe_graph_info.status().message());
-  }
-  graph_info_ = maybe_graph_info.value();
+  // Load graph info
+  GAR_OK_ASSIGN_OR_RAISE(graph_info_, GAR::GraphInfo::Load(graph_info_yaml));
   return {};
 }
 
@@ -116,26 +111,17 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteGraphInfo(
     // otherwise, only the last fragment writes graph info
     for (const auto& vertex_info : graph_info_->GetVertexInfos()) {
       const auto& label = vertex_info->GetLabel();
-      auto st = vertex_info->Save(output_path + label + ".vertex.yaml");
-      if (!st.ok()) {
-        RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
-      }
+      GAR_OK_OR_RAISE(vertex_info->Save(output_path + label + ".vertex.yaml"));
     }
     for (const auto& edge_info : graph_info_->GetEdgeInfos()) {
       const auto& src_label = edge_info->GetSrcLabel();
       const auto& edge_label = edge_info->GetEdgeLabel();
       const auto& dst_label = edge_info->GetDstLabel();
-      auto st = edge_info->Save(output_path + src_label + "_" + edge_label +
-                                "_" + dst_label + ".edge.yaml");
-      if (!st.ok()) {
-        RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
-      }
+      GAR_OK_OR_RAISE(edge_info->Save(output_path + src_label + "_" + edge_label +
+                                "_" + dst_label + ".edge.yaml"));
     }
     const auto& graph_name = graph_info_->GetName();
-    auto st = graph_info_->Save(output_path + graph_name + ".graph.yaml");
-    if (!st.ok()) {
-      RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
-    }
+    GAR_OK_OR_RAISE(graph_info_->Save(output_path + graph_name + ".graph.yaml"));
   }
   LOG_IF(INFO, !comm_spec_.worker_id()) << MARKER << "WRITING-GRAPH-INFO-100";
 
@@ -182,29 +168,26 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
 
   auto vm_ptr = frag_->GetVertexMap();
   // initialize the start vertex chunk index of fragment
-  GraphArchive::IdType chunk_index_begin = 0;
+  GAR::IdType chunk_index_begin = 0;
   for (fid_t fid = 0; fid < frag_->fid(); ++fid) {
     chunk_index_begin += static_cast<GraphArchive::IdType>(
         std::ceil(vm_ptr->GetInnerVertexSize(fid, label_id) /
                   static_cast<double>(vertex_info->GetChunkSize())));
   }
-  auto maybe_writer = GraphArchive::VertexPropertyWriter::Make(
-      vertex_info, graph_info_->GetPrefix());
-  auto writer = maybe_writer.value();
+  std::shared_ptr<GAR::VertexPropertyWriter> writer;
+  GAR_OK_ASSIGN_OR_RAISE(writer, GAR::VertexPropertyWriter::Make(
+      vertex_info, graph_info_->GetPrefix()));
   // write vertex data start from chunk index begin
   auto vertex_table = frag_->vertex_data_table(label_id);
   auto num_rows = vertex_table->num_rows();
   if (frag_->fid() != frag_->fnum() - 1 &&
       num_rows % vertex_info->GetChunkSize() != 0) {
     // Append nulls if the number of rows is not a multiple of chunk size.
-    vertex_table = AppendNullsToArrowTable(
+    BOOST_LEAF_ASSIGN(vertex_table, AppendNullsToArrowTable(
         vertex_table,
-        vertex_info->GetChunkSize() - num_rows % vertex_info->GetChunkSize());
+        vertex_info->GetChunkSize() - num_rows % vertex_info->GetChunkSize()));
   }
-  auto st = writer->WriteTable(vertex_table, chunk_index_begin);
-  if (!st.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
-  }
+  GAR_OK_OR_RAISE(writer->WriteTable(vertex_table, chunk_index_begin));
   if (store_in_local_) {
     int64_t vertex_chunk_num =
         std::ceil(vertex_table->num_rows() /
@@ -225,10 +208,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::WriteVertex(
         last_chunk_index_begin * vertex_info->GetChunkSize() +
         vm_ptr->GetInnerVertexSize(frag_->fnum() - 1, label_id);
     label_id_to_vnum_[label_id] = total_vertices_num;
-    auto st = writer->WriteVerticesNum(total_vertices_num);
-    if (!st.ok()) {
-      RETURN_GS_ERROR(ErrorCode::kGraphArError, st.message());
-    }
+    GAR_OK_OR_RAISE(writer->WriteVerticesNum(total_vertices_num));
   }
 
   return {};
@@ -416,7 +396,9 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
         std::dynamic_pointer_cast<arrow::Int64Builder>(builders[1]);
 
     // reset the builders
-    ResetArrowArrayBuilders(builders);
+    for (size_t i = 0; i < builders.size(); ++i) {
+      builders[i]->Reset();
+    }
     offset_builder.Reset();
 
     int64_t vertex_chunk_index = main_start_chunk_index + index;
@@ -472,9 +454,7 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     auto table = arrow::Table::Make(table_schema, column_arrays);
     auto s = writer->WriteTable(table, vertex_chunk_index);
     if (!s.ok()) {
-      return Status::IOError(
-          "GAR error: " + std::to_string(static_cast<int>(s.code())) + ", " +
-          s.message());
+      return Status::IOError(s.message());
     }
 
     // write the offset chunks
@@ -521,12 +501,12 @@ boost::leaf::result<void> ArrowFragmentWriter<FRAG_T>::writeEdgeImpl(
     return Status::OK();
   };
 
-  ThreadGroup tg(comm_spec_);
+  ThreadGroup tg(1);
   for (size_t chunk_index = 0; chunk_index < vertex_chunk_num; ++chunk_index) {
     tg.AddTask(fn, chunk_index);
   }
   Status status;
-  for (auto const& s : tg.TakeResults()) {
+  for (auto& s : tg.TakeResults()) {
     status += s;
   }
   VY_OK_OR_RAISE(status);
@@ -593,6 +573,9 @@ ArrowFragmentWriter<FRAG_T>::appendPropertiesToArrowArrayBuilders(
       ARROW_OK_OR_RAISE(builder->Append(
           edge.template get_data<arrow::Time64Type::c_type>(pid)));
     } else if (prop_type->id() == arrow::Type::TIMESTAMP) {
+      if (edge_label == 11) {
+        LOG(INFO) << "hasMember: " << edge.template get_data<int64_t>(pid);
+      }
       auto builder =
           std::dynamic_pointer_cast<arrow::TimestampBuilder>(builders[col_id]);
       ARROW_OK_OR_RAISE(builder->Append(
@@ -618,36 +601,18 @@ ArrowFragmentWriter<FRAG_T>::writeLocalVertexChunkBeginAndNum(
                      local_metadata_prefix + std::to_string(frag_->fid());
 
   std::shared_ptr<arrow::fs::FileSystem> fs;
-  auto fs_result = arrow::fs::FileSystemFromUriOrPath(path);
-  if (!fs_result.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kArrowError, fs_result.status().message());
-  }
-  fs = fs_result.ValueOrDie();
+  ARROW_OK_ASSIGN_OR_RAISE(fs, arrow::fs::FileSystemFromUriOrPath(path));
   std::shared_ptr<arrow::io::OutputStream> output_stream;
-  auto output_stream_result = fs->OpenOutputStream(path);
-  if (!output_stream_result.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kArrowError,
-                    output_stream_result.status().message());
-  }
-  output_stream = output_stream_result.ValueOrDie();
+  ARROW_OK_ASSIGN_OR_RAISE(output_stream, fs->OpenOutputStream(path));
 
   // write vertex chunk index begin and vertex chunk number to local
-  auto st = output_stream->Write(
+  ARROW_OK_OR_RAISE(output_stream->Write(
       reinterpret_cast<const uint8_t*>(&vertex_chunk_begin),
-      sizeof(vertex_chunk_begin));
-  if (!st.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kArrowError, st.message());
-  }
-  st = output_stream->Write(reinterpret_cast<const uint8_t*>(&vertex_chunk_num),
-                            sizeof(vertex_chunk_num));
-  if (!st.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kArrowError, st.message());
-  }
+      sizeof(vertex_chunk_begin)));
+  ARROW_OK_OR_RAISE(output_stream->Write(reinterpret_cast<const uint8_t*>(&vertex_chunk_num),
+                            sizeof(vertex_chunk_num)));
 
-  st = output_stream->Close();
-  if (!st.ok()) {
-    RETURN_GS_ERROR(ErrorCode::kArrowError, st.message());
-  }
+  ARROW_OK_OR_RAISE(output_stream->Close());
   return {};
 }
 
